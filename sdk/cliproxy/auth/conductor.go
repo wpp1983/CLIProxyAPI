@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -221,7 +222,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 
 func isBuiltInSelector(selector Selector) bool {
 	switch selector.(type) {
-	case *RoundRobinSelector, *FillFirstSelector:
+	case *RoundRobinSelector, *FillFirstSelector, *CodexQuotaScoreSelector:
 		return true
 	default:
 		return false
@@ -1140,6 +1141,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil {
 		return nil, nil
 	}
+	EnsureCodexQuotaRefreshMetadata(auth)
 	if auth.ID == "" {
 		auth.ID = uuid.NewString()
 	}
@@ -1163,6 +1165,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	EnsureCodexQuotaRefreshMetadata(auth)
 	m.mu.Lock()
 	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
 		if !auth.indexAssigned && auth.Index == "" {
@@ -1209,6 +1212,7 @@ func (m *Manager) Load(ctx context.Context) error {
 		if auth == nil || auth.ID == "" {
 			continue
 		}
+		EnsureCodexQuotaRefreshMetadata(auth)
 		auth.EnsureIndex()
 		m.auths[auth.ID] = auth.Clone()
 	}
@@ -2914,6 +2918,32 @@ func (m *Manager) GetByID(id string) (*Auth, bool) {
 		return nil, false
 	}
 	return auth.Clone(), true
+}
+
+// RefreshNow triggers an immediate refresh attempt for a single auth entry.
+func (m *Manager) RefreshNow(ctx context.Context, id string) error {
+	id = strings.TrimSpace(id)
+	if m == nil {
+		return fmt.Errorf("auth manager unavailable")
+	}
+	if id == "" {
+		return fmt.Errorf("auth id is required")
+	}
+	m.mu.RLock()
+	auth := m.auths[id]
+	var exec ProviderExecutor
+	if auth != nil {
+		exec = m.executors[auth.Provider]
+	}
+	m.mu.RUnlock()
+	if auth == nil {
+		return fmt.Errorf("auth not found")
+	}
+	if exec == nil {
+		return fmt.Errorf("provider executor unavailable for %s", auth.Provider)
+	}
+	m.refreshAuth(ctx, id)
+	return nil
 }
 
 // GetExecutionSessionAuthByID retrieves a Home runtime auth scoped to an execution session.
