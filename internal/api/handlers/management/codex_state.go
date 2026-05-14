@@ -1,0 +1,233 @@
+package management
+
+import (
+	"fmt"
+	"math"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+)
+
+type codexStateRefreshRequest struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	AuthIndex string `json:"auth_index"`
+	All       bool   `json:"all"`
+}
+
+func (h *Handler) GetCodexState(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+	auths := h.authManager.List()
+	items := make([]gin.H, 0, len(auths))
+	for _, auth := range auths {
+		if entry := buildCodexStateEntry(auth); entry != nil {
+			items = append(items, entry)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"codex-state": items})
+}
+
+func (h *Handler) PatchCodexStateManualScore(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+	var req struct {
+		ID        string   `json:"id"`
+		Name      string   `json:"name"`
+		AuthIndex string   `json:"auth_index"`
+		Value     *float64 `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if math.IsNaN(*req.Value) || math.IsInf(*req.Value, 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "value must be a finite number"})
+		return
+	}
+	targetAuth, err := h.findManagedCodexAuth(req.ID, req.Name, req.AuthIndex)
+	if err != nil {
+		status := http.StatusBadRequest
+		switch err.Error() {
+		case "auth not found":
+			status = http.StatusNotFound
+		case "core auth manager unavailable":
+			status = http.StatusServiceUnavailable
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	targetAuth.SetCodexManualScoreAdjustment(*req.Value)
+	targetAuth.UpdatedAt = time.Now()
+	if _, err := h.authManager.Update(c.Request.Context(), targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+	updated, ok := h.authManager.GetByID(targetAuth.ID)
+	if !ok {
+		updated = targetAuth
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":                        "ok",
+		"id":                            updated.ID,
+		"auth_index":                    updated.EnsureIndex(),
+		"name":                          codexStateName(updated),
+		"codex_manual_score_adjustment": *req.Value,
+	})
+}
+
+func (h *Handler) PostCodexStateRefresh(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+	var req codexStateRefreshRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	ctx := c.Request.Context()
+	if req.All {
+		refreshed := make([]gin.H, 0)
+		for _, auth := range h.authManager.List() {
+			if !coreauth.IsCodexOAuthLikeAuth(auth) {
+				continue
+			}
+			if err := h.authManager.RefreshNow(ctx, auth.ID); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to refresh auth %s: %v", auth.ID, err)})
+				return
+			}
+			refreshed = append(refreshed, gin.H{"id": auth.ID, "auth_index": auth.EnsureIndex(), "name": codexStateName(auth)})
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "refreshed": refreshed})
+		return
+	}
+	targetAuth, err := h.findManagedCodexAuth(req.ID, req.Name, req.AuthIndex)
+	if err != nil {
+		status := http.StatusBadRequest
+		switch err.Error() {
+		case "auth not found":
+			status = http.StatusNotFound
+		case "core auth manager unavailable":
+			status = http.StatusServiceUnavailable
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.authManager.RefreshNow(ctx, targetAuth.ID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to refresh auth: %v", err)})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "ok",
+		"refreshed": gin.H{"id": targetAuth.ID, "auth_index": targetAuth.EnsureIndex(), "name": codexStateName(targetAuth)},
+	})
+}
+
+func (h *Handler) findManagedCodexAuth(id, name, authIndex string) (*coreauth.Auth, error) {
+	if h == nil || h.authManager == nil {
+		return nil, fmt.Errorf("core auth manager unavailable")
+	}
+	id = strings.TrimSpace(id)
+	name = strings.TrimSpace(name)
+	authIndex = strings.TrimSpace(authIndex)
+	if id == "" && name == "" && authIndex == "" {
+		return nil, fmt.Errorf("id, name, or auth_index is required")
+	}
+	if id != "" {
+		if auth, ok := h.authManager.GetByID(id); ok {
+			if !coreauth.IsCodexOAuthLikeAuth(auth) {
+				return nil, fmt.Errorf("auth not found")
+			}
+			return auth, nil
+		}
+	}
+	if authIndex != "" {
+		if auth := h.authByIndex(authIndex); auth != nil {
+			if !coreauth.IsCodexOAuthLikeAuth(auth) {
+				return nil, fmt.Errorf("auth not found")
+			}
+			return auth, nil
+		}
+	}
+	if name != "" {
+		for _, auth := range h.authManager.List() {
+			if auth == nil {
+				continue
+			}
+			if auth.ID == name || auth.FileName == name {
+				if !coreauth.IsCodexOAuthLikeAuth(auth) {
+					return nil, fmt.Errorf("auth not found")
+				}
+				return auth, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("auth not found")
+}
+
+func buildCodexStateEntry(auth *coreauth.Auth) gin.H {
+	if auth == nil || !coreauth.IsCodexOAuthLikeAuth(auth) {
+		return nil
+	}
+	auth.EnsureIndex()
+	explanation := coreauth.BuildCodexScoreExplanation(auth, time.Now().UTC())
+	entry := gin.H{
+		"id":          auth.ID,
+		"auth_index":  auth.Index,
+		"name":        codexStateName(auth),
+		"provider":    strings.TrimSpace(auth.Provider),
+		"status":      auth.Status,
+		"disabled":    auth.Disabled,
+		"unavailable": auth.Unavailable,
+		coreauth.CodexScoreExplanationMetadataKey: explanation,
+	}
+	if email := authEmail(auth); email != "" {
+		entry["email"] = email
+	}
+	if accountType, account := auth.AccountInfo(); accountType != "" || account != "" {
+		if accountType != "" {
+			entry["account_type"] = accountType
+		}
+		if account != "" {
+			entry["account"] = account
+		}
+	}
+	if quota, ok := auth.GetCodexQuotaState(); ok {
+		entry[coreauth.CodexQuotaMetadataKey] = quota
+	}
+	if manual, ok := auth.CodexManualScoreAdjustment(); ok {
+		entry[coreauth.CodexManualScoreAdjustmentKey] = manual
+	}
+	if computed, ok := auth.CodexComputedScore(); ok {
+		entry[coreauth.CodexComputedScoreMetadataKey] = computed
+	}
+	if reason := auth.CodexScoreReason(); reason != "" {
+		entry[coreauth.CodexScoreReasonMetadataKey] = reason
+	}
+	if reason := auth.CodexLastSelectionReason(); reason != "" {
+		entry[coreauth.CodexLastSelectionReasonMetadataKey] = reason
+	}
+	if claims := extractCodexIDTokenClaims(auth); claims != nil {
+		entry["id_token"] = claims
+	}
+	return entry
+}
+
+func codexStateName(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	name := strings.TrimSpace(auth.FileName)
+	if name == "" {
+		name = strings.TrimSpace(auth.ID)
+	}
+	return name
+}
