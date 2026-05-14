@@ -18,6 +18,7 @@ const (
 	schedulerStrategyCustom schedulerStrategy = iota
 	schedulerStrategyRoundRobin
 	schedulerStrategyFillFirst
+	schedulerStrategyCodexQuotaScore
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -178,6 +179,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 	switch selector.(type) {
 	case *FillFirstSelector:
 		return schedulerStrategyFillFirst
+	case *CodexQuotaScoreSelector:
+		return schedulerStrategyCodexQuotaScore
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
@@ -355,6 +358,37 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 	}
 	if !hasCandidate {
 		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, tried)
+	}
+
+	if s.strategy == schedulerStrategyCodexQuotaScore {
+		codexCandidates := make([]*scheduledAuth, 0)
+		allCodex := true
+		for providerIndex := range normalized {
+			shard := candidateShards[providerIndex]
+			if shard == nil {
+				continue
+			}
+			entries := shard.readyEntriesAtPriorityLocked(false, bestPriority, predicate)
+			for _, entry := range entries {
+				if entry == nil || entry.auth == nil {
+					continue
+				}
+				if !strings.EqualFold(strings.TrimSpace(entry.auth.Provider), "codex") {
+					allCodex = false
+					break
+				}
+				codexCandidates = append(codexCandidates, entry)
+			}
+			if !allCodex {
+				break
+			}
+		}
+		if allCodex && len(codexCandidates) > 0 {
+			picked := pickBestCodexQuotaScoreScheduledAuth(codexCandidates, now)
+			if picked != nil && picked.auth != nil {
+				return picked.auth, strings.ToLower(strings.TrimSpace(picked.auth.Provider)), nil
+			}
+		}
 	}
 
 	if s.strategy == schedulerStrategyFillFirst {
@@ -817,6 +851,13 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	var picked *scheduledAuth
 	if strategy == schedulerStrategyFillFirst {
 		picked = view.pickFirst(predicate)
+	} else if strategy == schedulerStrategyCodexQuotaScore {
+		entries := view.readyEntries(predicate)
+		if scheduledEntriesAllCodex(entries) {
+			picked = pickBestCodexQuotaScoreScheduledAuth(entries, time.Now())
+		} else {
+			picked = view.pickRoundRobin(predicate)
+		}
 	} else {
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -838,6 +879,53 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 		return len(bucket.ws.flat)
 	}
 	return len(bucket.all.flat)
+}
+
+func (m *modelScheduler) readyEntriesAtPriorityLocked(preferWebsocket bool, priority int, predicate func(*scheduledAuth) bool) []*scheduledAuth {
+	if m == nil {
+		return nil
+	}
+	bucket := m.readyByPriority[priority]
+	if bucket == nil {
+		return nil
+	}
+	view := &bucket.all
+	if preferWebsocket && bucket.ws.pickFirst(predicate) != nil {
+		view = &bucket.ws
+	}
+	return view.readyEntries(predicate)
+}
+
+func pickBestCodexQuotaScoreScheduledAuth(entries []*scheduledAuth, now time.Time) *scheduledAuth {
+	if len(entries) == 0 {
+		return nil
+	}
+	auths := make([]*Auth, 0, len(entries))
+	byID := make(map[string]*scheduledAuth, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		auths = append(auths, entry.auth)
+		byID[entry.auth.ID] = entry
+	}
+	picked := pickBestCodexQuotaScoreAuth(auths, now)
+	if picked == nil {
+		return nil
+	}
+	return byID[picked.ID]
+}
+
+func scheduledEntriesAllCodex(entries []*scheduledAuth) bool {
+	if len(entries) == 0 {
+		return false
+	}
+	for _, entry := range entries {
+		if entry == nil || entry.auth == nil || !strings.EqualFold(strings.TrimSpace(entry.auth.Provider), "codex") {
+			return false
+		}
+	}
+	return true
 }
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
@@ -1001,6 +1089,20 @@ func (v *readyView) pickFirst(predicate func(*scheduledAuth) bool) *scheduledAut
 		}
 	}
 	return nil
+}
+
+func (v *readyView) readyEntries(predicate func(*scheduledAuth) bool) []*scheduledAuth {
+	if v == nil || len(v.flat) == 0 {
+		return nil
+	}
+	out := make([]*scheduledAuth, 0, len(v.flat))
+	for _, entry := range v.flat {
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // pickRoundRobin returns the next ready entry using flat or grouped round-robin traversal.
