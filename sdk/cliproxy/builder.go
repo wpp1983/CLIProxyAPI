@@ -5,8 +5,6 @@ package cliproxy
 
 import (
 	"fmt"
-	"strings"
-	"time"
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v7/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/api"
@@ -207,35 +205,11 @@ func (b *Builder) Build() (*Service, error) {
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
 		}
-
-		strategy := ""
-		sessionAffinity := false
-		sessionAffinityTTL := time.Hour
 		if b.cfg != nil {
-			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
-			// Support both legacy ClaudeCodeSessionAffinity and new universal SessionAffinity
-			sessionAffinity = b.cfg.Routing.SessionAffinity
-			if ttlStr := strings.TrimSpace(b.cfg.Routing.SessionAffinityTTL); ttlStr != "" {
-				if parsed, err := time.ParseDuration(ttlStr); err == nil && parsed > 0 {
-					sessionAffinityTTL = parsed
-				}
-			}
-		}
-		var selector coreauth.Selector
-		switch strategy {
-		case "fill-first", "fillfirst", "ff":
-			selector = &coreauth.FillFirstSelector{}
-		default:
-			selector = &coreauth.RoundRobinSelector{}
+			b.cfg.Routing.Strategy = config.NormalizeRoutingStrategy(b.cfg.Routing.Strategy)
 		}
 
-		// Wrap with session affinity if enabled (failover is always on)
-		if sessionAffinity {
-			selector = coreauth.NewSessionAffinitySelectorWithConfig(coreauth.SessionAffinityConfig{
-				Fallback: selector,
-				TTL:      sessionAffinityTTL,
-			})
-		}
+		selector := selectorFromRoutingConfig(b.cfg)
 
 		coreManager = coreauth.NewManager(tokenStore, selector, nil)
 	}
