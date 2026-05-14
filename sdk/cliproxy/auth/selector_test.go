@@ -14,6 +14,22 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
+func newCodexScoreTestAuth(id string, weeklyRemaining, weeklyLimit float64, weeklyReset time.Time, manual float64) *Auth {
+	lastRefresh := time.Now().Add(-1 * time.Minute).UTC()
+	a := &Auth{ID: id, Provider: "codex"}
+	a.SetCodexQuotaState(CodexQuotaState{
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(weeklyRemaining),
+			Limit:     float64Ptr(weeklyLimit),
+			ResetAt:   &weeklyReset,
+		},
+		LastRefreshAt: &lastRefresh,
+		RefreshStatus: "ok",
+	})
+	a.SetCodexManualScoreAdjustment(manual)
+	return a
+}
+
 func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
 	t.Parallel()
 
@@ -58,6 +74,175 @@ func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 		if got.ID != id {
 			t.Fatalf("Pick() #%d auth.ID = %q, want %q", i, got.ID, id)
 		}
+	}
+}
+
+func TestCodexQuotaScoreSelectorPick_PrefersKnownScore(t *testing.T) {
+	t.Parallel()
+
+	selector := &CodexQuotaScoreSelector{}
+	resetAt := time.Now().Add(10 * time.Hour)
+	unknown := &Auth{ID: "unknown", Provider: "codex"}
+	unknown.SetCodexManualScoreAdjustment(100)
+	known := newCodexScoreTestAuth("known", 20, 100, resetAt, 0)
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{unknown, known})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "known" {
+		t.Fatalf("Pick() auth = %#v, want known", got)
+	}
+}
+
+func TestCodexQuotaScoreSelectorPick_UsesTieBreakers(t *testing.T) {
+	t.Parallel()
+
+	selector := &CodexQuotaScoreSelector{}
+	weeklyReset := time.Now().Add(10 * time.Hour)
+	fiveHourLater := time.Now().Add(4 * time.Hour)
+	fiveHourSooner := time.Now().Add(2 * time.Hour)
+
+	highPct := newCodexScoreTestAuth("b-auth", 100, 200, weeklyReset, 0)
+	highPct.SetCodexQuotaState(CodexQuotaState{
+		FiveHour: CodexQuotaBucket{ResetAt: &fiveHourLater},
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(100),
+			Limit:     float64Ptr(200),
+			ResetAt:   &weeklyReset,
+		},
+	})
+	lowPctSoonerReset := newCodexScoreTestAuth("a-auth", 100, 400, weeklyReset, 0)
+	lowPctSoonerReset.SetCodexQuotaState(CodexQuotaState{
+		FiveHour: CodexQuotaBucket{ResetAt: &fiveHourSooner},
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(100),
+			Limit:     float64Ptr(400),
+			ResetAt:   &weeklyReset,
+		},
+	})
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{highPct, lowPctSoonerReset})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "b-auth" {
+		t.Fatalf("Pick() auth = %#v, want b-auth due to higher weekly percentage", got)
+	}
+
+	equalPctA := newCodexScoreTestAuth("a-auth", 100, 200, weeklyReset, 0)
+	equalPctA.SetCodexQuotaState(CodexQuotaState{
+		FiveHour: CodexQuotaBucket{ResetAt: &fiveHourSooner},
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(100),
+			Limit:     float64Ptr(200),
+			ResetAt:   &weeklyReset,
+		},
+	})
+	equalPctB := newCodexScoreTestAuth("b-auth", 100, 200, weeklyReset, 0)
+	equalPctB.SetCodexQuotaState(CodexQuotaState{
+		FiveHour: CodexQuotaBucket{ResetAt: &fiveHourLater},
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(100),
+			Limit:     float64Ptr(200),
+			ResetAt:   &weeklyReset,
+		},
+	})
+
+	got, err = selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{equalPctB, equalPctA})
+	if err != nil {
+		t.Fatalf("Pick() tie-break error = %v", err)
+	}
+	if got == nil || got.ID != "a-auth" {
+		t.Fatalf("Pick() auth = %#v, want a-auth due to earlier usable 5h reset then auth ID", got)
+	}
+}
+
+func TestCodexQuotaScoreSelectorPick_MixedNonCodexFallsBackToRoundRobin(t *testing.T) {
+	t.Parallel()
+
+	selector := &CodexQuotaScoreSelector{}
+	resetAt := time.Now().Add(10 * time.Hour)
+	auths := []*Auth{
+		newCodexScoreTestAuth("b-codex", 30, 100, resetAt, 0),
+		{ID: "a-gemini", Provider: "gemini"},
+	}
+
+	first, err := selector.Pick(context.Background(), "mixed", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() first error = %v", err)
+	}
+	second, err := selector.Pick(context.Background(), "mixed", "", cliproxyexecutor.Options{}, auths)
+	if err != nil {
+		t.Fatalf("Pick() second error = %v", err)
+	}
+	if first == nil || second == nil {
+		t.Fatalf("Pick() returned nil auths: first=%#v second=%#v", first, second)
+	}
+	if first.ID != "a-gemini" || second.ID != "b-codex" {
+		t.Fatalf("fallback round-robin order = %q, %q; want a-gemini then b-codex", first.ID, second.ID)
+	}
+}
+
+func TestCodexQuotaScoreSelectorPick_MissingOrStaleRefreshRanksBehindFreshKnownScore(t *testing.T) {
+	t.Parallel()
+
+	selector := &CodexQuotaScoreSelector{}
+	resetAt := time.Now().Add(10 * time.Hour)
+	fresh := newCodexScoreTestAuth("fresh", 20, 100, resetAt, 0)
+	missingRefresh := &Auth{ID: "missing-refresh", Provider: "codex"}
+	missingRefresh.SetCodexQuotaState(CodexQuotaState{
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(50),
+			Limit:     float64Ptr(100),
+			ResetAt:   &resetAt,
+		},
+	})
+	staleRefreshAt := time.Now().Add(-20 * time.Minute).UTC()
+	stale := &Auth{ID: "stale", Provider: "codex"}
+	stale.SetCodexQuotaState(CodexQuotaState{
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(50),
+			Limit:     float64Ptr(100),
+			ResetAt:   &resetAt,
+		},
+		LastRefreshAt: &staleRefreshAt,
+		RefreshStatus: "ok",
+	})
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{missingRefresh, fresh, stale})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "fresh" {
+		t.Fatalf("Pick() auth = %#v, want fresh", got)
+	}
+}
+
+func TestCodexQuotaScoreSelectorPick_FailedRefreshStatusRanksBehindFreshKnownScore(t *testing.T) {
+	t.Parallel()
+
+	selector := &CodexQuotaScoreSelector{}
+	resetAt := time.Now().Add(10 * time.Hour)
+	fresh := newCodexScoreTestAuth("fresh", 20, 100, resetAt, 0)
+	failedRefreshAt := time.Now().Add(-1 * time.Minute).UTC()
+	failed := &Auth{ID: "failed", Provider: "codex"}
+	failed.SetCodexQuotaState(CodexQuotaState{
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(90),
+			Limit:     float64Ptr(100),
+			ResetAt:   &resetAt,
+		},
+		LastRefreshAt: &failedRefreshAt,
+		RefreshStatus: "error",
+	})
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{failed, fresh})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "fresh" {
+		t.Fatalf("Pick() auth = %#v, want fresh", got)
 	}
 }
 

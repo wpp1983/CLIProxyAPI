@@ -35,6 +35,14 @@ type RoundRobinSelector struct {
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
 
+// CodexQuotaScoreSelector applies Codex quota-aware ranking when every candidate
+// in the active slice is a Codex auth. Otherwise it falls back to round-robin.
+type CodexQuotaScoreSelector struct {
+	fallback RoundRobinSelector
+}
+
+const codexQuotaScoreFreshnessWindow = 15 * time.Minute
+
 type blockReason int
 
 const (
@@ -366,6 +374,150 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
+}
+
+func (s *CodexQuotaScoreSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+	if canUseCodexQuotaScoreSelection(provider, available) {
+		if picked := pickBestCodexQuotaScoreAuth(available, now); picked != nil {
+			return picked, nil
+		}
+	}
+	return s.fallback.Pick(ctx, provider, model, opts, auths)
+}
+
+type codexQuotaScoreSnapshot struct {
+	auth                   *Auth
+	hasKnownScore          bool
+	finalScore             float64
+	hasWeeklyRemaining     bool
+	weeklyRemaining        float64
+	hasWeeklyPct           bool
+	weeklyPct              float64
+	hasUsableFiveHourReset bool
+	fiveHourReset          time.Time
+}
+
+func canUseCodexQuotaScoreSelection(provider string, auths []*Auth) bool {
+	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	if providerKey != "codex" && providerKey != "mixed" {
+		return false
+	}
+	if len(auths) == 0 {
+		return false
+	}
+	for _, auth := range auths {
+		if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+			return false
+		}
+	}
+	return true
+}
+
+func pickBestCodexQuotaScoreAuth(auths []*Auth, now time.Time) *Auth {
+	if len(auths) == 0 {
+		return nil
+	}
+	snapshots := make([]codexQuotaScoreSnapshot, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		snapshots = append(snapshots, codexQuotaScoreSnapshotForAuth(auth, now))
+	}
+	if len(snapshots) == 0 {
+		return nil
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		return codexQuotaScoreLess(snapshots[i], snapshots[j])
+	})
+	return snapshots[0].auth
+}
+
+func codexQuotaScoreSnapshotForAuth(auth *Auth, now time.Time) codexQuotaScoreSnapshot {
+	snapshot := codexQuotaScoreSnapshot{auth: auth}
+	if auth == nil {
+		return snapshot
+	}
+	explanation := BuildCodexScoreExplanation(auth, now)
+	quota, ok := auth.GetCodexQuotaState()
+	if !ok {
+		return snapshot
+	}
+	if explanation.WeeklyRemaining != nil {
+		snapshot.hasWeeklyRemaining = true
+		snapshot.weeklyRemaining = *explanation.WeeklyRemaining
+	}
+	if explanation.WeeklyRemaining != nil && explanation.WeeklyLimit != nil && *explanation.WeeklyLimit > 0 {
+		snapshot.hasWeeklyPct = true
+		snapshot.weeklyPct = *explanation.WeeklyRemaining / *explanation.WeeklyLimit
+	}
+	if quota.FiveHour.ResetAt != nil && quota.FiveHour.ResetAt.After(now) {
+		snapshot.hasUsableFiveHourReset = true
+		snapshot.fiveHourReset = quota.FiveHour.ResetAt.UTC()
+	}
+	if explanation.ScoreAvailable && explanation.ComputedScoreLive != nil {
+		snapshot.finalScore = *explanation.ComputedScoreLive
+		snapshot.hasKnownScore = true
+	}
+	return snapshot
+}
+
+func codexQuotaRefreshStateUsable(quota CodexQuotaState, now time.Time) bool {
+	if quota.LastRefreshAt == nil || quota.LastRefreshAt.IsZero() {
+		return false
+	}
+	if quota.LastRefreshAt.Before(now.Add(-codexQuotaScoreFreshnessWindow)) {
+		return false
+	}
+	status := strings.ToLower(strings.TrimSpace(quota.RefreshStatus))
+	switch status {
+	case "", "ok", "success", "fresh":
+		return true
+	default:
+		return false
+	}
+}
+
+func codexQuotaScoreLess(left, right codexQuotaScoreSnapshot) bool {
+	if left.hasKnownScore != right.hasKnownScore {
+		return left.hasKnownScore
+	}
+	if left.hasKnownScore && right.hasKnownScore && left.finalScore != right.finalScore {
+		return left.finalScore > right.finalScore
+	}
+	if left.hasWeeklyRemaining != right.hasWeeklyRemaining {
+		return left.hasWeeklyRemaining
+	}
+	if left.hasWeeklyRemaining && right.hasWeeklyRemaining && left.weeklyRemaining != right.weeklyRemaining {
+		return left.weeklyRemaining > right.weeklyRemaining
+	}
+	if left.hasWeeklyPct != right.hasWeeklyPct {
+		return left.hasWeeklyPct
+	}
+	if left.hasWeeklyPct && right.hasWeeklyPct && left.weeklyPct != right.weeklyPct {
+		return left.weeklyPct > right.weeklyPct
+	}
+	if left.hasUsableFiveHourReset != right.hasUsableFiveHourReset {
+		return left.hasUsableFiveHourReset
+	}
+	if left.hasUsableFiveHourReset && right.hasUsableFiveHourReset && !left.fiveHourReset.Equal(right.fiveHourReset) {
+		return left.fiveHourReset.Before(right.fiveHourReset)
+	}
+	leftID := ""
+	rightID := ""
+	if left.auth != nil {
+		leftID = left.auth.ID
+	}
+	if right.auth != nil {
+		rightID = right.auth.ID
+	}
+	return leftID < rightID
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
