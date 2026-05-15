@@ -854,7 +854,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	} else if strategy == schedulerStrategyCodexQuotaScore {
 		entries := view.readyEntries(predicate)
 		if scheduledEntriesAllCodex(entries) {
-			picked = pickBestCodexQuotaScoreScheduledAuth(entries, time.Now())
+			picked = pickStickyOrBestCodexQuotaScoreScheduledAuth(m.modelKey, entries, time.Now())
 		} else {
 			picked = view.pickRoundRobin(predicate)
 		}
@@ -910,6 +910,26 @@ func pickBestCodexQuotaScoreScheduledAuth(entries []*scheduledAuth, now time.Tim
 		byID[entry.auth.ID] = entry
 	}
 	picked := pickBestCodexQuotaScoreAuth(auths, now)
+	if picked == nil {
+		return nil
+	}
+	return byID[picked.ID]
+}
+
+func pickStickyOrBestCodexQuotaScoreScheduledAuth(model string, entries []*scheduledAuth, now time.Time) *scheduledAuth {
+	if len(entries) == 0 {
+		return nil
+	}
+	auths := make([]*Auth, 0, len(entries))
+	byID := make(map[string]*scheduledAuth, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		auths = append(auths, entry.auth)
+		byID[entry.auth.ID] = entry
+	}
+	picked := pickStickyOrBestCodexQuotaScoreAuth("codex", model, auths, now)
 	if picked == nil {
 		return nil
 	}
