@@ -454,6 +454,20 @@ func pickBestCodexQuotaScoreAuth(auths []*Auth, now time.Time) *Auth {
 	return snapshots[0].auth
 }
 
+func pickBestRetainableCodexQuotaScoreAuth(auths []*Auth, now time.Time) *Auth {
+	filtered := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || !codexStickyRetainable(auth, now) {
+			continue
+		}
+		filtered = append(filtered, auth)
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return pickBestCodexQuotaScoreAuth(filtered, now)
+}
+
 func pickStickyOrBestCodexQuotaScoreAuth(state *codexStickySelectionState, provider, model string, auths []*Auth, now time.Time) *Auth {
 	if len(auths) == 0 {
 		return nil
@@ -585,13 +599,11 @@ func RecalculateCurrentCodexStickyAuth(auths []*Auth, now time.Time) *Auth {
 		}
 		filtered = append(filtered, auth)
 	}
-	picked := pickBestCodexQuotaScoreAuth(filtered, now)
+	picked := pickBestRetainableCodexQuotaScoreAuth(filtered, now)
 	if picked == nil {
 		return nil
 	}
-	if codexStickyRetainable(picked, now) {
-		globalCodexStickySelection.set(key, picked.ID)
-	}
+	globalCodexStickySelection.set(key, picked.ID)
 	return picked
 }
 
