@@ -952,6 +952,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
 			close(closedCh)
 			remaining = closedCh
 		}
+		if provider == "codex" && ApplyCodexQuotaHeaderUpdate(auth, streamResult.Headers, time.Now().UTC()) {
+			_, _ = m.Update(ctx, auth)
+		}
 		return m.wrapStreamResult(ctx, auth.Clone(), provider, resultModel, streamResult.Headers, buffered, remaining), nil
 	}
 	if lastErr == nil {
@@ -1415,6 +1418,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				authErr = errExec
 				continue
 			}
+			if provider == "codex" && ApplyCodexQuotaHeaderUpdate(auth, resp.Headers, time.Now().UTC()) {
+				_, _ = m.Update(execCtx, auth)
+			}
 			m.MarkResult(execCtx, result)
 			return resp, nil
 		}
@@ -1513,6 +1519,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				}
 				authErr = errExec
 				continue
+			}
+			if provider == "codex" && ApplyCodexQuotaHeaderUpdate(auth, resp.Headers, time.Now().UTC()) {
+				_, _ = m.Update(execCtx, auth)
 			}
 			m.MarkResult(execCtx, result)
 			return resp, nil

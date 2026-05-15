@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"math"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -256,6 +257,32 @@ func TestEnsureCodexQuotaRefreshMetadata_SkipsAPIKeyAuths(t *testing.T) {
 	EnsureCodexQuotaRefreshMetadata(a)
 	if a.Metadata != nil {
 		t.Fatalf("Metadata = %#v, want nil for codex-api-key auth", a.Metadata)
+	}
+}
+
+func TestApplyCodexQuotaHeaderUpdate_ParsesResponseHeaders(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 5, 15, 3, 0, 0, 0, time.UTC)
+	a := &Auth{Provider: "codex", Metadata: map[string]any{"email": "user@example.com"}}
+	headers := http.Header{}
+	headers.Set("x-codex-primary-used-percent", "40")
+	headers.Set("x-codex-primary-reset-at", "2026-05-15T05:00:00Z")
+	headers.Set("x-codex-secondary-used-percent", "10")
+	headers.Set("x-codex-secondary-reset-at", "2026-05-21T05:00:00Z")
+	headers.Set("retry-after", "120")
+	if !ApplyCodexQuotaHeaderUpdate(a, headers, now) {
+		t.Fatal("ApplyCodexQuotaHeaderUpdate() = false, want true")
+	}
+	quota, ok := a.GetCodexQuotaState()
+	if !ok {
+		t.Fatal("GetCodexQuotaState() ok = false, want true")
+	}
+	assertFloatPtr(t, quota.FiveHour.Remaining, 60)
+	assertFloatPtr(t, quota.FiveHour.Limit, 100)
+	assertFloatPtr(t, quota.Weekly.Remaining, 90)
+	assertFloatPtr(t, quota.Weekly.Limit, 100)
+	if !a.Unavailable || a.Quota.NextRecoverAt.IsZero() {
+		t.Fatalf("expected retry-after to propagate cooldown, got unavailable=%v quota=%#v", a.Unavailable, a.Quota)
 	}
 }
 

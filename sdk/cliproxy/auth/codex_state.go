@@ -3,6 +3,7 @@ package auth
 import (
 	"encoding/json"
 	"math"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -388,4 +389,161 @@ func sanitizeFiniteFloat(v float64) (float64, bool) {
 
 func float64Ptr(v float64) *float64 {
 	return &v
+}
+
+func ApplyCodexQuotaHeaderUpdate(auth *Auth, headers http.Header, now time.Time) bool {
+	if auth == nil || !IsCodexOAuthLikeAuth(auth) || headers == nil {
+		return false
+	}
+	update := extractCodexQuotaHeaderUpdate(headers, now)
+	if !update.hasAnyData() {
+		return false
+	}
+	state, _ := auth.GetCodexQuotaState()
+	if update.FiveHour.hasData() {
+		state.FiveHour = update.FiveHour
+	}
+	if update.Weekly.hasData() {
+		state.Weekly = update.Weekly
+	}
+	state.LastRefreshAt = &now
+	state.RefreshStatus = "ok"
+	state.RefreshError = ""
+	auth.SetCodexQuotaState(state)
+	if !update.BlockedUntil.IsZero() {
+		blockedUntil := update.BlockedUntil.UTC()
+		ApplyCodexQuotaBlockedUntil(auth, &blockedUntil)
+	}
+	return true
+}
+
+type codexQuotaHeaderUpdate struct {
+	FiveHour     CodexQuotaBucket
+	Weekly       CodexQuotaBucket
+	BlockedUntil time.Time
+}
+
+func (u codexQuotaHeaderUpdate) hasAnyData() bool {
+	return u.FiveHour.hasData() || u.Weekly.hasData() || !u.BlockedUntil.IsZero()
+}
+
+func extractCodexQuotaHeaderUpdate(headers http.Header, now time.Time) codexQuotaHeaderUpdate {
+	var update codexQuotaHeaderUpdate
+	for rawName, values := range headers {
+		if len(values) == 0 {
+			continue
+		}
+		name := strings.ToLower(strings.TrimSpace(rawName))
+		value := strings.TrimSpace(values[0])
+		if value == "" {
+			continue
+		}
+		if strings.HasPrefix(name, "x-codex-primary-") || strings.HasPrefix(name, "x-codex-secondary-") {
+			bucket := &update.FiveHour
+			if strings.HasPrefix(name, "x-codex-secondary-") {
+				bucket = &update.Weekly
+			}
+			switch {
+			case strings.HasSuffix(name, "used-percent"):
+				if used, ok := parseHeaderNumber(value); ok {
+					remaining := math.Max(0, 100-used)
+					bucket.Limit = float64Ptr(100)
+					bucket.Remaining = float64Ptr(remaining)
+				}
+			case strings.HasSuffix(name, "reset-at"):
+				if ts, ok := parseHeaderTimestamp(value, now); ok {
+					bucket.ResetAt = &ts
+				}
+			}
+			continue
+		}
+		if strings.HasPrefix(name, "x-ratelimit-") {
+			var bucket *CodexQuotaBucket
+			switch {
+			case strings.Contains(name, "5h"), strings.Contains(name, "5hr"), strings.Contains(name, "5hour"), strings.Contains(name, "5-hour"):
+				bucket = &update.FiveHour
+			case strings.Contains(name, "week"), strings.Contains(name, "weekly"), strings.Contains(name, "1w"), strings.Contains(name, "7d"):
+				bucket = &update.Weekly
+			}
+			if bucket == nil {
+				continue
+			}
+			switch {
+			case strings.Contains(name, "limit"):
+				if n, ok := parseHeaderNumber(value); ok {
+					bucket.Limit = float64Ptr(n)
+				}
+			case strings.Contains(name, "remaining"):
+				if n, ok := parseHeaderNumber(value); ok {
+					bucket.Remaining = float64Ptr(n)
+				}
+			case strings.Contains(name, "reset"):
+				if ts, ok := parseHeaderTimestamp(value, now); ok {
+					bucket.ResetAt = &ts
+				}
+			}
+			continue
+		}
+		if name == "retry-after" {
+			if ts, ok := parseRetryAfterTimestamp(value, now); ok {
+				update.BlockedUntil = ts
+			}
+		}
+	}
+	return update
+}
+
+func parseHeaderNumber(value string) (float64, bool) {
+	match := strings.TrimSpace(value)
+	if match == "" {
+		return 0, false
+	}
+	for i, r := range match {
+		if !(r == '-' || r == '+' || r == '.' || (r >= '0' && r <= '9')) {
+			match = match[:i]
+			break
+		}
+	}
+	if match == "" || match == "+" || match == "-" || match == "." {
+		return 0, false
+	}
+	parsed, err := strconv.ParseFloat(match, 64)
+	if err != nil {
+		return 0, false
+	}
+	return sanitizeFiniteFloat(parsed)
+}
+
+func parseHeaderTimestamp(value string, now time.Time) (time.Time, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return time.Time{}, false
+	}
+	if ts, ok := parseTimeValue(trimmed); ok && !ts.IsZero() {
+		return ts.UTC(), true
+	}
+	if secs, ok := parseHeaderNumber(trimmed); ok && secs > 0 {
+		if secs > 1e12 {
+			return time.UnixMilli(int64(secs)).UTC(), true
+		}
+		if secs > 1e9 {
+			return time.Unix(int64(secs), 0).UTC(), true
+		}
+		return now.Add(time.Duration(secs * float64(time.Second))).UTC(), true
+	}
+	return time.Time{}, false
+}
+
+func parseRetryAfterTimestamp(value string, now time.Time) (time.Time, bool) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return time.Time{}, false
+	}
+	if secs, err := strconv.ParseFloat(trimmed, 64); err == nil && secs >= 0 {
+		return now.Add(time.Duration(secs * float64(time.Second))).UTC(), true
+	}
+	if ts, err := http.ParseTime(trimmed); err == nil {
+		return ts.UTC(), true
+	}
+	return time.Time{}, false
 }
