@@ -988,6 +988,7 @@ func codexQuotaRefreshURLs(baseURL string) []string {
 
 func parseCodexQuotaRefreshPayload(body []byte) (codexQuotaRefreshPayload, bool) {
 	payload := codexQuotaRefreshPayload{}
+	now := time.Now().UTC()
 	payload.state.FiveHour = parseCodexQuotaBucket(body,
 		"quota.five_hour", "quota.fiveHour", "five_hour", "fiveHour",
 		"usage.five_hour", "usage.fiveHour", "ratelimits.five_hour", "ratelimits.fiveHour",
@@ -997,10 +998,10 @@ func parseCodexQuotaRefreshPayload(body []byte) (codexQuotaRefreshPayload, bool)
 		"usage.weekly", "usage.weekly_window", "ratelimits.weekly", "ratelimits.weekly_window",
 	)
 	if !codexQuotaBucketHasData(payload.state.Weekly) {
-		payload.state.Weekly = parseCodexQuotaBucket(body, "rate_limit.primary_window")
+		payload.state.Weekly = parseCodexQuotaBucketAt(body, now, "rate_limit.secondary_window")
 	}
 	if !codexQuotaBucketHasData(payload.state.FiveHour) {
-		payload.state.FiveHour = parseCodexQuotaBucket(body, "rate_limit.secondary_window")
+		payload.state.FiveHour = parseCodexQuotaBucketAt(body, now, "rate_limit.primary_window")
 	}
 	mergeCodexAdditionalRateLimitBuckets(body, &payload.state)
 	if blockedUntil, ok := firstTimePath(body,
@@ -1016,6 +1017,10 @@ func parseCodexQuotaRefreshPayload(body []byte) (codexQuotaRefreshPayload, bool)
 }
 
 func parseCodexQuotaBucket(body []byte, prefixes ...string) cliproxyauth.CodexQuotaBucket {
+	return parseCodexQuotaBucketAt(body, time.Now().UTC(), prefixes...)
+}
+
+func parseCodexQuotaBucketAt(body []byte, now time.Time, prefixes ...string) cliproxyauth.CodexQuotaBucket {
 	for _, prefix := range prefixes {
 		bucket := cliproxyauth.CodexQuotaBucket{}
 		if remaining, ok := firstFloatPath(body,
@@ -1034,14 +1039,34 @@ func parseCodexQuotaBucket(body []byte, prefixes ...string) cliproxyauth.CodexQu
 		); ok {
 			bucket.Limit = &limit
 		}
-		if resetAt, ok := firstTimePath(body,
+		if resetAt, ok := firstQuotaResetPath(body, now,
 			codexQuotaFieldPath(prefix, "reset_at"),
 			codexQuotaFieldPath(prefix, "resetAt"),
 			codexQuotaFieldPath(prefix, "resets_at"),
 			codexQuotaFieldPath(prefix, "resetsAt"),
 			codexQuotaFieldPath(prefix, "next_reset_at"),
+			codexQuotaFieldPath(prefix, "reset_after_seconds"),
+			codexQuotaFieldPath(prefix, "resetAfterSeconds"),
+			codexQuotaFieldPath(prefix, "resets_after_seconds"),
+			codexQuotaFieldPath(prefix, "resetsAfterSeconds"),
 		); ok {
 			bucket.ResetAt = &resetAt
+		}
+		if bucket.Remaining == nil {
+			if usedPercent, ok := firstFloatPath(body,
+				codexQuotaFieldPath(prefix, "used_percent"),
+				codexQuotaFieldPath(prefix, "usedPercent"),
+			); ok {
+				limit := 100.0
+				remaining := limit - usedPercent
+				if remaining < 0 {
+					remaining = 0
+				}
+				if bucket.Limit == nil {
+					bucket.Limit = &limit
+				}
+				bucket.Remaining = &remaining
+			}
 		}
 		if codexQuotaBucketHasData(bucket) {
 			return bucket
@@ -1072,7 +1097,7 @@ func mergeCodexAdditionalRateLimitBuckets(body []byte, state *cliproxyauth.Codex
 			continue
 		}
 		for _, item := range result.Array() {
-			bucket := parseCodexQuotaBucket([]byte(item.Raw), "")
+			bucket := parseCodexQuotaBucketAt([]byte(item.Raw), time.Now().UTC(), "")
 			if !codexQuotaBucketHasData(bucket) {
 				continue
 			}
@@ -1197,6 +1222,38 @@ func firstTimePath(body []byte, paths ...string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+func firstQuotaResetPath(body []byte, now time.Time, paths ...string) (time.Time, bool) {
+	absolutePaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		trimmed := strings.TrimSpace(path)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasSuffix(lower, "seconds") {
+			result := gjson.GetBytes(body, trimmed)
+			if !result.Exists() {
+				continue
+			}
+			seconds := 0.0
+			switch result.Type {
+			case gjson.Number:
+				seconds = result.Float()
+			case gjson.String:
+				if value, ok := cliproxyauthFloatString(result.String()); ok {
+					seconds = value
+				}
+			}
+			if seconds > 0 {
+				return now.Add(time.Duration(seconds * float64(time.Second))).UTC(), true
+			}
+			continue
+		}
+		absolutePaths = append(absolutePaths, trimmed)
+	}
+	return firstTimePath(body, absolutePaths...)
 }
 
 func firstStringPath(body []byte, paths ...string) (string, bool) {

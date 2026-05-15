@@ -83,8 +83,8 @@ func TestCodexExecutorRefresh_UsesUsageEndpointAndParsesUsageWindows(t *testing.
 	t.Parallel()
 
 	blockedUntil := time.Now().Add(25 * time.Minute).UTC().Truncate(time.Second)
-	weeklyReset := time.Now().Add(6 * 24 * time.Hour).UTC().Truncate(time.Second)
 	fiveHourReset := time.Now().Add(4 * time.Hour).UTC().Truncate(time.Second)
+	weeklyReset := time.Now().Add(6 * 24 * time.Hour).UTC().Truncate(time.Second)
 	var usageRequests atomic.Int32
 	var otherRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -92,7 +92,7 @@ func TestCodexExecutorRefresh_UsesUsageEndpointAndParsesUsageWindows(t *testing.
 		case "/backend-api/codex/usage":
 			usageRequests.Add(1)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"remaining":81,"limit":100,"reset_at":"` + weeklyReset.Format(time.RFC3339) + `"},"secondary_window":{"remaining":7,"limit":40,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `","blocked_until":"` + blockedUntil.Format(time.RFC3339) + `"},"additional_rate_limits":[{"window_name":"five_hour","remaining":7,"limit":40,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `"}]}}`))
+			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":19,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `","blocked_until":"` + blockedUntil.Format(time.RFC3339) + `"},"secondary_window":{"used_percent":42,"reset_after_seconds":518400},"additional_rate_limits":[{"window_name":"weekly","remaining":3,"limit":9,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `"},{"window_name":"five_hour","remaining":1,"limit":9,"reset_at":"` + weeklyReset.Format(time.RFC3339) + `"}]}}`))
 		default:
 			otherRequests.Add(1)
 			http.NotFound(w, r)
@@ -126,20 +126,76 @@ func TestCodexExecutorRefresh_UsesUsageEndpointAndParsesUsageWindows(t *testing.
 	if !ok {
 		t.Fatal("GetCodexQuotaState() ok = false, want true")
 	}
-	if quota.Weekly.Remaining == nil || *quota.Weekly.Remaining != 81 {
-		t.Fatalf("Weekly.Remaining = %#v, want 81", quota.Weekly.Remaining)
+	if quota.Weekly.Remaining == nil || *quota.Weekly.Remaining != 58 {
+		t.Fatalf("Weekly.Remaining = %#v, want 58", quota.Weekly.Remaining)
 	}
-	if quota.FiveHour.Remaining == nil || *quota.FiveHour.Remaining != 7 {
-		t.Fatalf("FiveHour.Remaining = %#v, want 7", quota.FiveHour.Remaining)
+	if quota.Weekly.Limit == nil || *quota.Weekly.Limit != 100 {
+		t.Fatalf("Weekly.Limit = %#v, want 100", quota.Weekly.Limit)
 	}
-	if quota.Weekly.ResetAt == nil || !quota.Weekly.ResetAt.Equal(weeklyReset) {
-		t.Fatalf("Weekly.ResetAt = %v, want %v", quota.Weekly.ResetAt, weeklyReset)
+	if quota.FiveHour.Remaining == nil || *quota.FiveHour.Remaining != 81 {
+		t.Fatalf("FiveHour.Remaining = %#v, want 81", quota.FiveHour.Remaining)
+	}
+	if quota.FiveHour.Limit == nil || *quota.FiveHour.Limit != 100 {
+		t.Fatalf("FiveHour.Limit = %#v, want 100", quota.FiveHour.Limit)
+	}
+	if quota.Weekly.ResetAt == nil || quota.Weekly.ResetAt.Before(time.Now().Add(143*time.Hour)) || quota.Weekly.ResetAt.After(time.Now().Add(145*time.Hour)) {
+		t.Fatalf("Weekly.ResetAt = %v, want about 144h from now via reset_after_seconds", quota.Weekly.ResetAt)
 	}
 	if quota.FiveHour.ResetAt == nil || !quota.FiveHour.ResetAt.Equal(fiveHourReset) {
 		t.Fatalf("FiveHour.ResetAt = %v, want %v", quota.FiveHour.ResetAt, fiveHourReset)
 	}
 	if !updated.Unavailable || !updated.NextRetryAfter.Equal(blockedUntil) {
 		t.Fatalf("auth cooldown = unavailable %v next %s, want true/%s", updated.Unavailable, updated.NextRetryAfter, blockedUntil)
+	}
+}
+
+func TestCodexExecutorRefresh_UsesAdditionalRateLimitsOnlyAsFallback(t *testing.T) {
+	t.Parallel()
+
+	weeklyReset := time.Now().Add(7 * 24 * time.Hour).UTC().Truncate(time.Second)
+	fiveHourReset := time.Now().Add(5 * time.Hour).UTC().Truncate(time.Second)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/codex/usage":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"remaining":9,"limit":40,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `"},"secondary_window":{"remaining":70,"limit":100,"reset_at":"` + weeklyReset.Format(time.RFC3339) + `"},"additional_rate_limits":[{"window_name":"weekly","remaining":1,"limit":2,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `"},{"window_name":"five_hour","remaining":2,"limit":3,"reset_at":"` + weeklyReset.Format(time.RFC3339) + `"}]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewCodexExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email":        "user@example.com",
+			"access_token": "token-123",
+		},
+		Attributes: map[string]string{
+			"base_url": server.URL + "/backend-api/codex",
+		},
+	}
+
+	updated, err := executor.Refresh(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	quota, ok := updated.GetCodexQuotaState()
+	if !ok {
+		t.Fatal("GetCodexQuotaState() ok = false, want true")
+	}
+	if quota.FiveHour.Remaining == nil || *quota.FiveHour.Remaining != 9 {
+		t.Fatalf("FiveHour.Remaining = %#v, want primary window value 9", quota.FiveHour.Remaining)
+	}
+	if quota.Weekly.Remaining == nil || *quota.Weekly.Remaining != 70 {
+		t.Fatalf("Weekly.Remaining = %#v, want secondary window value 70", quota.Weekly.Remaining)
+	}
+	if quota.FiveHour.ResetAt == nil || !quota.FiveHour.ResetAt.Equal(fiveHourReset) {
+		t.Fatalf("FiveHour.ResetAt = %v, want %v", quota.FiveHour.ResetAt, fiveHourReset)
+	}
+	if quota.Weekly.ResetAt == nil || !quota.Weekly.ResetAt.Equal(weeklyReset) {
+		t.Fatalf("Weekly.ResetAt = %v, want %v", quota.Weekly.ResetAt, weeklyReset)
 	}
 }
 
