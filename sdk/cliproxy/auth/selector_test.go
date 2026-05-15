@@ -80,7 +80,7 @@ func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 func TestCodexQuotaScoreSelectorPick_PrefersKnownScore(t *testing.T) {
 	t.Parallel()
 
-	selector := &CodexQuotaScoreSelector{}
+	selector := &CodexQuotaScoreSelector{sticky: &codexStickySelectionState{byKey: map[string]string{}}}
 	resetAt := time.Now().Add(10 * time.Hour)
 	unknown := &Auth{ID: "unknown", Provider: "codex"}
 	unknown.SetCodexManualScoreAdjustment(100)
@@ -98,7 +98,7 @@ func TestCodexQuotaScoreSelectorPick_PrefersKnownScore(t *testing.T) {
 func TestCodexQuotaScoreSelectorPick_UsesTieBreakers(t *testing.T) {
 	t.Parallel()
 
-	selector := &CodexQuotaScoreSelector{}
+	selector := &CodexQuotaScoreSelector{sticky: &codexStickySelectionState{byKey: map[string]string{}}}
 	weeklyReset := time.Now().Add(10 * time.Hour)
 	fiveHourLater := time.Now().Add(4 * time.Hour)
 	fiveHourSooner := time.Now().Add(2 * time.Hour)
@@ -161,7 +161,7 @@ func TestCodexQuotaScoreSelectorPick_UsesTieBreakers(t *testing.T) {
 func TestCodexQuotaScoreSelectorPick_MixedNonCodexFallsBackToRoundRobin(t *testing.T) {
 	t.Parallel()
 
-	selector := &CodexQuotaScoreSelector{}
+	selector := &CodexQuotaScoreSelector{sticky: &codexStickySelectionState{byKey: map[string]string{}}}
 	resetAt := time.Now().Add(10 * time.Hour)
 	auths := []*Auth{
 		newCodexScoreTestAuth("b-codex", 30, 100, resetAt, 0),
@@ -187,7 +187,7 @@ func TestCodexQuotaScoreSelectorPick_MixedNonCodexFallsBackToRoundRobin(t *testi
 func TestCodexQuotaScoreSelectorPick_MissingOrStaleRefreshRanksBehindFreshKnownScore(t *testing.T) {
 	t.Parallel()
 
-	selector := &CodexQuotaScoreSelector{}
+	selector := &CodexQuotaScoreSelector{sticky: &codexStickySelectionState{byKey: map[string]string{}}}
 	resetAt := time.Now().Add(10 * time.Hour)
 	fresh := newCodexScoreTestAuth("fresh", 20, 100, resetAt, 0)
 	missingRefresh := &Auth{ID: "missing-refresh", Provider: "codex"}
@@ -222,7 +222,7 @@ func TestCodexQuotaScoreSelectorPick_MissingOrStaleRefreshRanksBehindFreshKnownS
 func TestCodexQuotaScoreSelectorPick_FailedRefreshStatusRanksBehindFreshKnownScore(t *testing.T) {
 	t.Parallel()
 
-	selector := &CodexQuotaScoreSelector{}
+	selector := &CodexQuotaScoreSelector{sticky: &codexStickySelectionState{byKey: map[string]string{}}}
 	resetAt := time.Now().Add(10 * time.Hour)
 	fresh := newCodexScoreTestAuth("fresh", 20, 100, resetAt, 0)
 	failedRefreshAt := time.Now().Add(-1 * time.Minute).UTC()
@@ -249,7 +249,7 @@ func TestCodexQuotaScoreSelectorPick_FailedRefreshStatusRanksBehindFreshKnownSco
 func TestCodexQuotaScoreSelectorPick_StaysStickyUntilFiveHourExhausted(t *testing.T) {
 	t.Parallel()
 
-	selector := &CodexQuotaScoreSelector{}
+	selector := &CodexQuotaScoreSelector{sticky: &codexStickySelectionState{byKey: map[string]string{}}}
 	now := time.Now()
 	weeklyReset := now.Add(12 * time.Hour)
 	fiveHourReset := now.Add(2 * time.Hour)
@@ -302,7 +302,7 @@ func TestCodexQuotaScoreSelectorPick_StaysStickyUntilFiveHourExhausted(t *testin
 func TestCodexQuotaScoreSelectorPick_ReleasesStickyOnUnknownFiveHour(t *testing.T) {
 	t.Parallel()
 
-	selector := &CodexQuotaScoreSelector{}
+	selector := &CodexQuotaScoreSelector{sticky: &codexStickySelectionState{byKey: map[string]string{}}}
 	weeklyReset := time.Now().Add(12 * time.Hour)
 	fiveHourReset := time.Now().Add(2 * time.Hour)
 	first := newCodexScoreTestAuth("first-unknown", 90, 100, weeklyReset, 0)

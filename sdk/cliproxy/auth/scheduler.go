@@ -929,7 +929,7 @@ func pickStickyOrBestCodexQuotaScoreScheduledAuth(model string, entries []*sched
 		auths = append(auths, entry.auth)
 		byID[entry.auth.ID] = entry
 	}
-	picked := pickStickyOrBestCodexQuotaScoreAuth("codex", model, auths, now)
+	picked := pickStickyOrBestCodexQuotaScoreAuth(globalCodexStickySelection, "codex", model, auths, now)
 	if picked == nil {
 		return nil
 	}

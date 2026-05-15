@@ -39,6 +39,7 @@ type FillFirstSelector struct{}
 // in the active slice is a Codex auth. Otherwise it falls back to round-robin.
 type CodexQuotaScoreSelector struct {
 	fallback RoundRobinSelector
+	sticky   *codexStickySelectionState
 }
 
 type codexStickySelectionState struct {
@@ -391,11 +392,18 @@ func (s *CodexQuotaScoreSelector) Pick(ctx context.Context, provider, model stri
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	if canUseCodexQuotaScoreSelection(provider, available) {
-		if picked := pickStickyOrBestCodexQuotaScoreAuth(provider, model, available, now); picked != nil {
+		if picked := pickStickyOrBestCodexQuotaScoreAuth(s.stickyState(), provider, model, available, now); picked != nil {
 			return picked, nil
 		}
 	}
 	return s.fallback.Pick(ctx, provider, model, opts, auths)
+}
+
+func (s *CodexQuotaScoreSelector) stickyState() *codexStickySelectionState {
+	if s == nil || s.sticky == nil {
+		return globalCodexStickySelection
+	}
+	return s.sticky
 }
 
 type codexQuotaScoreSnapshot struct {
@@ -446,23 +454,26 @@ func pickBestCodexQuotaScoreAuth(auths []*Auth, now time.Time) *Auth {
 	return snapshots[0].auth
 }
 
-func pickStickyOrBestCodexQuotaScoreAuth(provider, model string, auths []*Auth, now time.Time) *Auth {
+func pickStickyOrBestCodexQuotaScoreAuth(state *codexStickySelectionState, provider, model string, auths []*Auth, now time.Time) *Auth {
 	if len(auths) == 0 {
 		return nil
 	}
+	if state == nil {
+		state = globalCodexStickySelection
+	}
 	key := codexStickySelectionKey(provider, model)
-	if picked := globalCodexStickySelection.pickRetained(key, auths, now); picked != nil {
+	if picked := state.pickRetained(key, auths, now); picked != nil {
 		return picked
 	}
 	picked := pickBestCodexQuotaScoreAuth(auths, now)
 	if picked == nil {
-		globalCodexStickySelection.clear(key)
+		state.clear(key)
 		return nil
 	}
 	if codexStickyRetainable(picked, now) {
-		globalCodexStickySelection.set(key, picked.ID)
+		state.set(key, picked.ID)
 	} else {
-		globalCodexStickySelection.clear(key)
+		state.clear(key)
 	}
 	return picked
 }
@@ -479,8 +490,12 @@ func (s *codexStickySelectionState) pickRetained(key string, auths []*Auth, now 
 	if s == nil {
 		return nil
 	}
+	providerRoot := strings.SplitN(strings.TrimSpace(key), ":", 2)[0] + ":"
 	s.mu.Lock()
 	stickyID := s.byKey[key]
+	if strings.TrimSpace(stickyID) == "" {
+		stickyID = s.byKey[providerRoot]
+	}
 	s.mu.Unlock()
 	if strings.TrimSpace(stickyID) == "" {
 		return nil
@@ -504,6 +519,24 @@ func (s *codexStickySelectionState) set(key, authID string) {
 	}
 	s.mu.Lock()
 	s.byKey[key] = authID
+	s.mu.Unlock()
+}
+
+func (s *codexStickySelectionState) clearProvider(provider string) {
+	if s == nil {
+		return
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	if providerKey == "" {
+		return
+	}
+	prefix := providerKey + ":"
+	s.mu.Lock()
+	for key := range s.byKey {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.byKey, key)
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -544,7 +577,7 @@ func CurrentCodexStickyAuthID() string {
 
 func RecalculateCurrentCodexStickyAuth(auths []*Auth, now time.Time) *Auth {
 	key := codexStickySelectionKey("codex", "")
-	globalCodexStickySelection.clear(key)
+	globalCodexStickySelection.clearProvider("codex")
 	filtered := make([]*Auth, 0, len(auths))
 	for _, auth := range auths {
 		if auth == nil || !IsCodexOAuthLikeAuth(auth) {
@@ -552,7 +585,14 @@ func RecalculateCurrentCodexStickyAuth(auths []*Auth, now time.Time) *Auth {
 		}
 		filtered = append(filtered, auth)
 	}
-	return pickStickyOrBestCodexQuotaScoreAuth("codex", "", filtered, now)
+	picked := pickBestCodexQuotaScoreAuth(filtered, now)
+	if picked == nil {
+		return nil
+	}
+	if codexStickyRetainable(picked, now) {
+		globalCodexStickySelection.set(key, picked.ID)
+	}
+	return picked
 }
 
 func codexStickyRetainable(auth *Auth, now time.Time) bool {
