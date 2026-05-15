@@ -45,9 +45,10 @@ type CodexQuotaScoreSelector struct {
 type codexStickySelectionState struct {
 	mu    sync.Mutex
 	byKey map[string]string
+	byProvider map[string]string
 }
 
-var globalCodexStickySelection = &codexStickySelectionState{byKey: map[string]string{}}
+var globalCodexStickySelection = &codexStickySelectionState{byKey: map[string]string{}, byProvider: map[string]string{}}
 
 const codexQuotaScoreFreshnessWindow = 15 * time.Minute
 
@@ -504,6 +505,7 @@ func (s *codexStickySelectionState) pickRetained(key string, auths []*Auth, now 
 	if s == nil {
 		return nil
 	}
+	providerKey := providerFromStickySelectionKey(key)
 	providerRoot := strings.SplitN(strings.TrimSpace(key), ":", 2)[0] + ":"
 	s.mu.Lock()
 	stickyID := s.byKey[key]
@@ -519,6 +521,14 @@ func (s *codexStickySelectionState) pickRetained(key string, auths []*Auth, now 
 			continue
 		}
 		if codexStickyRetainable(auth, now) {
+			if providerKey != "" {
+				s.mu.Lock()
+				if s.byProvider == nil {
+					s.byProvider = map[string]string{}
+				}
+				s.byProvider[providerKey] = auth.ID
+				s.mu.Unlock()
+			}
 			return auth
 		}
 		break
@@ -531,8 +541,18 @@ func (s *codexStickySelectionState) set(key, authID string) {
 	if s == nil || strings.TrimSpace(key) == "" || strings.TrimSpace(authID) == "" {
 		return
 	}
+	providerKey := providerFromStickySelectionKey(key)
 	s.mu.Lock()
+	if s.byKey == nil {
+		s.byKey = map[string]string{}
+	}
+	if s.byProvider == nil {
+		s.byProvider = map[string]string{}
+	}
 	s.byKey[key] = authID
+	if providerKey != "" {
+		s.byProvider[providerKey] = authID
+	}
 	s.mu.Unlock()
 }
 
@@ -551,6 +571,7 @@ func (s *codexStickySelectionState) clearProvider(provider string) {
 			delete(s.byKey, key)
 		}
 	}
+	delete(s.byProvider, providerKey)
 	s.mu.Unlock()
 }
 
@@ -558,8 +579,27 @@ func (s *codexStickySelectionState) clear(key string) {
 	if s == nil || strings.TrimSpace(key) == "" {
 		return
 	}
+	providerKey := providerFromStickySelectionKey(key)
 	s.mu.Lock()
+	clearedAuthID := strings.TrimSpace(s.byKey[key])
 	delete(s.byKey, key)
+	if providerKey != "" && strings.TrimSpace(s.byProvider[providerKey]) == clearedAuthID {
+		providerRoot := providerKey + ":"
+		next := strings.TrimSpace(s.byKey[providerRoot])
+		if next == "" {
+			for existingKey, authID := range s.byKey {
+				if strings.HasPrefix(existingKey, providerRoot) && strings.TrimSpace(authID) != "" {
+					next = strings.TrimSpace(authID)
+					break
+				}
+			}
+		}
+		if next == "" {
+			delete(s.byProvider, providerKey)
+		} else {
+			s.byProvider[providerKey] = next
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -571,18 +611,18 @@ func (s *codexStickySelectionState) currentAuthIDForProvider(provider string) st
 	if providerKey == "" {
 		providerKey = "codex"
 	}
-	prefix := providerKey + ":"
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if direct := strings.TrimSpace(s.byKey[prefix]); direct != "" {
-		return direct
+	return strings.TrimSpace(s.byProvider[providerKey])
+}
+
+func providerFromStickySelectionKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
 	}
-	for key, authID := range s.byKey {
-		if strings.HasPrefix(key, prefix) && strings.TrimSpace(authID) != "" {
-			return authID
-		}
-	}
-	return ""
+	parts := strings.SplitN(key, ":", 2)
+	return strings.ToLower(strings.TrimSpace(parts[0]))
 }
 
 func CurrentCodexStickyAuthID() string {

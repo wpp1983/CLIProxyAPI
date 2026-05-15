@@ -383,6 +383,57 @@ func TestCodexQuotaScoreSelectorPick_ReleasesStickyOnUnavailableOrStale(t *testi
 	}
 }
 
+func TestCodexQuotaScoreSelectorPick_UpdatesProviderCurrentFromModelSpecificPick(t *testing.T) {
+	t.Parallel()
+
+	state := &codexStickySelectionState{byKey: map[string]string{}, byProvider: map[string]string{}}
+	selector := &CodexQuotaScoreSelector{sticky: state}
+	weeklyReset := time.Now().Add(12 * time.Hour)
+	fiveHourReset := time.Now().Add(2 * time.Hour)
+	b := newCodexScoreTestAuth("b-auth", 95, 100, weeklyReset, 0)
+	b.SetCodexQuotaState(CodexQuotaState{
+		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(8), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:   CodexQuotaBucket{Remaining: float64Ptr(95), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
+		RefreshStatus: "ok",
+	})
+	l := newCodexScoreTestAuth("l-auth", 60, 100, weeklyReset, 0)
+	l.SetCodexQuotaState(CodexQuotaState{
+		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(8), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:   CodexQuotaBucket{Remaining: float64Ptr(60), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
+		RefreshStatus: "ok",
+	})
+
+	state.set(codexStickySelectionKey("codex", ""), "l-auth")
+	state.set(codexStickySelectionKey("codex", "gpt-5.4"), "b-auth")
+	got, err := selector.Pick(context.Background(), "codex", "gpt-5.4", cliproxyexecutor.Options{}, []*Auth{l, b})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "b-auth" {
+		t.Fatalf("Pick() auth = %#v, want b-auth", got)
+	}
+	if current := state.currentAuthIDForProvider("codex"); current != "b-auth" {
+		t.Fatalf("currentAuthIDForProvider() = %q, want b-auth", current)
+	}
+}
+
+func TestCodexStickySelectionStateClearPromotesRemainingProviderAuth(t *testing.T) {
+	t.Parallel()
+
+	state := &codexStickySelectionState{byKey: map[string]string{}, byProvider: map[string]string{}}
+	state.set(codexStickySelectionKey("codex", "gpt-5.4"), "b-auth")
+	state.set(codexStickySelectionKey("codex", "gpt-4.1"), "l-auth")
+	if current := state.currentAuthIDForProvider("codex"); current != "l-auth" {
+		t.Fatalf("currentAuthIDForProvider() before clear = %q, want l-auth", current)
+	}
+	state.clear(codexStickySelectionKey("codex", "gpt-4.1"))
+	if current := state.currentAuthIDForProvider("codex"); current != "b-auth" {
+		t.Fatalf("currentAuthIDForProvider() after clear = %q, want b-auth", current)
+	}
+}
+
 func TestRoundRobinSelectorPick_PriorityBuckets(t *testing.T) {
 	t.Parallel()
 
