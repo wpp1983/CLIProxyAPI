@@ -671,6 +671,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/codex-state", s.mgmt.GetCodexState)
 		mgmt.PATCH("/codex-state/manual-score", s.mgmt.PatchCodexStateManualScore)
 		mgmt.POST("/codex-state/refresh", s.mgmt.PostCodexStateRefresh)
+		mgmt.POST("/codex-state/recalc", s.mgmt.PostCodexStateRecalc)
 
 		mgmt.GET("/openai-compatibility", s.mgmt.GetOpenAICompat)
 		mgmt.PUT("/openai-compatibility", s.mgmt.PutOpenAICompat)

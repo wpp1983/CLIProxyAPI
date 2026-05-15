@@ -542,6 +542,19 @@ func CurrentCodexStickyAuthID() string {
 	return globalCodexStickySelection.currentAuthIDForProvider("codex")
 }
 
+func RecalculateCurrentCodexStickyAuth(auths []*Auth, now time.Time) *Auth {
+	key := codexStickySelectionKey("codex", "")
+	globalCodexStickySelection.clear(key)
+	filtered := make([]*Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil || !IsCodexOAuthLikeAuth(auth) {
+			continue
+		}
+		filtered = append(filtered, auth)
+	}
+	return pickStickyOrBestCodexQuotaScoreAuth("codex", "", filtered, now)
+}
+
 func codexStickyRetainable(auth *Auth, now time.Time) bool {
 	if auth == nil || !IsCodexOAuthLikeAuth(auth) {
 		return false

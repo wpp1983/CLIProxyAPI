@@ -18,6 +18,29 @@ type codexStateRefreshRequest struct {
 	All       bool   `json:"all"`
 }
 
+func (h *Handler) PostCodexStateRecalc(c *gin.Context) {
+	if h == nil || h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+	auths := h.authManager.List()
+	picked := coreauth.RecalculateCurrentCodexStickyAuth(auths, time.Now().UTC())
+	if picked == nil {
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "on_device": nil})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"on_device": gin.H{
+			"id":         picked.ID,
+			"auth_index": picked.EnsureIndex(),
+			"name":       codexStateName(picked),
+			"email":      authEmail(picked),
+			"account":    buildCodexStateAccountLabel(picked),
+		},
+	})
+}
+
 func (h *Handler) GetCodexState(c *gin.Context) {
 	if h == nil || h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -221,6 +244,14 @@ func buildCodexStateEntry(auth *coreauth.Auth) gin.H {
 		entry["id_token"] = claims
 	}
 	return entry
+}
+
+func buildCodexStateAccountLabel(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	_, account := auth.AccountInfo()
+	return strings.TrimSpace(account)
 }
 
 func codexStateName(auth *coreauth.Auth) string {
