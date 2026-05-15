@@ -516,6 +516,32 @@ func (s *codexStickySelectionState) clear(key string) {
 	s.mu.Unlock()
 }
 
+func (s *codexStickySelectionState) currentAuthIDForProvider(provider string) string {
+	if s == nil {
+		return ""
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(provider))
+	if providerKey == "" {
+		providerKey = "codex"
+	}
+	prefix := providerKey + ":"
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if direct := strings.TrimSpace(s.byKey[prefix]); direct != "" {
+		return direct
+	}
+	for key, authID := range s.byKey {
+		if strings.HasPrefix(key, prefix) && strings.TrimSpace(authID) != "" {
+			return authID
+		}
+	}
+	return ""
+}
+
+func CurrentCodexStickyAuthID() string {
+	return globalCodexStickySelection.currentAuthIDForProvider("codex")
+}
+
 func codexStickyRetainable(auth *Auth, now time.Time) bool {
 	if auth == nil || !IsCodexOAuthLikeAuth(auth) {
 		return false

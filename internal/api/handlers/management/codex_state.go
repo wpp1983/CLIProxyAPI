@@ -179,6 +179,7 @@ func buildCodexStateEntry(auth *coreauth.Auth) gin.H {
 	}
 	auth.EnsureIndex()
 	explanation := coreauth.BuildCodexScoreExplanation(auth, time.Now().UTC())
+	stickyAuthID := coreauth.CurrentCodexStickyAuthID()
 	entry := gin.H{
 		"id":          auth.ID,
 		"auth_index":  auth.Index,
@@ -187,6 +188,7 @@ func buildCodexStateEntry(auth *coreauth.Auth) gin.H {
 		"status":      auth.Status,
 		"disabled":    auth.Disabled,
 		"unavailable": auth.Unavailable,
+		"on_device":   strings.TrimSpace(stickyAuthID) != "" && auth.ID == stickyAuthID,
 		coreauth.CodexScoreExplanationMetadataKey: explanation,
 	}
 	if email := authEmail(auth); email != "" {
