@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ const (
 )
 
 const CodexQuotaRefreshInterval = 15 * time.Minute
+const CodexQuotaResetProbeWindow = 14 * time.Minute
 
 type CodexQuotaBucket struct {
 	Remaining *float64   `json:"remaining,omitempty"`
@@ -27,11 +29,16 @@ type CodexQuotaBucket struct {
 }
 
 type CodexQuotaState struct {
-	FiveHour      CodexQuotaBucket `json:"five_hour,omitempty"`
-	Weekly        CodexQuotaBucket `json:"weekly,omitempty"`
-	LastRefreshAt *time.Time       `json:"last_refresh_at,omitempty"`
-	RefreshStatus string           `json:"refresh_status,omitempty"`
-	RefreshError  string           `json:"refresh_error,omitempty"`
+	FiveHour        CodexQuotaBucket `json:"five_hour,omitempty"`
+	Weekly          CodexQuotaBucket `json:"weekly,omitempty"`
+	LastRefreshAt   *time.Time       `json:"last_refresh_at,omitempty"`
+	RefreshStatus   string           `json:"refresh_status,omitempty"`
+	RefreshError    string           `json:"refresh_error,omitempty"`
+	ProbeResetAt    *time.Time       `json:"probe_reset_at,omitempty"`
+	ProbeAt         *time.Time       `json:"probe_at,omitempty"`
+	ProbeVerifiedAt *time.Time       `json:"probe_verified_at,omitempty"`
+	ProbeStatus     string           `json:"probe_status,omitempty"`
+	ProbeError      string           `json:"probe_error,omitempty"`
 }
 
 func (b CodexQuotaBucket) clone() CodexQuotaBucket {
@@ -55,10 +62,24 @@ func (s CodexQuotaState) clone() CodexQuotaState {
 		Weekly:        s.Weekly.clone(),
 		RefreshStatus: s.RefreshStatus,
 		RefreshError:  s.RefreshError,
+		ProbeStatus:   s.ProbeStatus,
+		ProbeError:    s.ProbeError,
 	}
 	if s.LastRefreshAt != nil {
 		lastRefresh := s.LastRefreshAt.UTC()
 		cloned.LastRefreshAt = &lastRefresh
+	}
+	if s.ProbeResetAt != nil {
+		probeResetAt := s.ProbeResetAt.UTC()
+		cloned.ProbeResetAt = &probeResetAt
+	}
+	if s.ProbeAt != nil {
+		probeAt := s.ProbeAt.UTC()
+		cloned.ProbeAt = &probeAt
+	}
+	if s.ProbeVerifiedAt != nil {
+		probeVerifiedAt := s.ProbeVerifiedAt.UTC()
+		cloned.ProbeVerifiedAt = &probeVerifiedAt
 	}
 	return cloned
 }
@@ -254,6 +275,21 @@ func codexQuotaStateFromMap(raw map[string]any) (CodexQuotaState, bool) {
 	if refreshErr, ok := raw["refresh_error"].(string); ok {
 		state.RefreshError = strings.TrimSpace(refreshErr)
 	}
+	if ts, ok := parseTimeValue(raw["probe_reset_at"]); ok && !ts.IsZero() {
+		state.ProbeResetAt = &ts
+	}
+	if ts, ok := parseTimeValue(raw["probe_at"]); ok && !ts.IsZero() {
+		state.ProbeAt = &ts
+	}
+	if ts, ok := parseTimeValue(raw["probe_verified_at"]); ok && !ts.IsZero() {
+		state.ProbeVerifiedAt = &ts
+	}
+	if status, ok := raw["probe_status"].(string); ok {
+		state.ProbeStatus = strings.TrimSpace(status)
+	}
+	if probeErr, ok := raw["probe_error"].(string); ok {
+		state.ProbeError = strings.TrimSpace(probeErr)
+	}
 	return state, state.hasData()
 }
 
@@ -297,7 +333,7 @@ func codexQuotaBucketFromMap(raw map[string]any) CodexQuotaBucket {
 }
 
 func (s CodexQuotaState) hasData() bool {
-	return s.FiveHour.hasData() || s.Weekly.hasData() || s.LastRefreshAt != nil || s.RefreshStatus != "" || s.RefreshError != ""
+	return s.FiveHour.hasData() || s.Weekly.hasData() || s.LastRefreshAt != nil || s.RefreshStatus != "" || s.RefreshError != "" || s.ProbeResetAt != nil || s.ProbeAt != nil || s.ProbeVerifiedAt != nil || s.ProbeStatus != "" || s.ProbeError != ""
 }
 
 func (b CodexQuotaBucket) hasData() bool {
@@ -324,10 +360,95 @@ func (s CodexQuotaState) metadataValue() any {
 	if trimmed := strings.TrimSpace(s.RefreshError); trimmed != "" {
 		out["refresh_error"] = trimmed
 	}
+	if s.ProbeResetAt != nil && !s.ProbeResetAt.IsZero() {
+		out["probe_reset_at"] = s.ProbeResetAt.UTC().Format(time.RFC3339)
+	}
+	if s.ProbeAt != nil && !s.ProbeAt.IsZero() {
+		out["probe_at"] = s.ProbeAt.UTC().Format(time.RFC3339)
+	}
+	if s.ProbeVerifiedAt != nil && !s.ProbeVerifiedAt.IsZero() {
+		out["probe_verified_at"] = s.ProbeVerifiedAt.UTC().Format(time.RFC3339)
+	}
+	if trimmed := strings.TrimSpace(s.ProbeStatus); trimmed != "" {
+		out["probe_status"] = trimmed
+	}
+	if trimmed := strings.TrimSpace(s.ProbeError); trimmed != "" {
+		out["probe_error"] = trimmed
+	}
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+func (s CodexQuotaState) CodexProbeEligibleResetAt(now time.Time) (*time.Time, bool) {
+	for _, resetAt := range s.codexProbeCandidateResetAts(now) {
+		if codexProbeAnchorDistance(now, resetAt) > CodexQuotaResetProbeWindow {
+			continue
+		}
+		resetAtCopy := resetAt
+		return &resetAtCopy, true
+	}
+	return nil, false
+}
+
+func (s CodexQuotaState) CodexProbeWindowResetAt(now time.Time) (*time.Time, bool) {
+	for _, resetAt := range s.codexProbeCandidateResetAts(now) {
+		if codexProbeAnchorDistance(now, resetAt) > CodexQuotaResetProbeWindow {
+			continue
+		}
+		resetAtCopy := resetAt
+		return &resetAtCopy, true
+	}
+	return nil, false
+}
+
+func (s CodexQuotaState) CodexProbeVerifiedForReset(resetAt time.Time) bool {
+	status := strings.ToLower(strings.TrimSpace(s.ProbeStatus))
+	if status != "verified" && status != "success" && status != "ok" {
+		return false
+	}
+	if s.ProbeResetAt == nil || s.ProbeVerifiedAt == nil || s.ProbeResetAt.IsZero() || s.ProbeVerifiedAt.IsZero() {
+		return false
+	}
+	return s.ProbeResetAt.UTC().Equal(resetAt.UTC())
+}
+
+func (s CodexQuotaState) codexProbeCandidateResetAts(now time.Time) []time.Time {
+	candidates := make([]time.Time, 0, 2)
+	for _, resetAt := range []*time.Time{s.FiveHour.ResetAt, s.Weekly.ResetAt} {
+		if resetAt == nil || resetAt.IsZero() {
+			continue
+		}
+		candidates = append(candidates, resetAt.UTC())
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		di := codexProbeAnchorDistance(now, candidates[i])
+		dj := codexProbeAnchorDistance(now, candidates[j])
+		if di == dj {
+			return candidates[i].Before(candidates[j])
+		}
+		return di < dj
+	})
+	return candidates
+}
+
+func codexProbeAnchorDistance(now, resetAt time.Time) time.Duration {
+	return absDuration(now.Sub(codexProbeAnchorTime(resetAt)))
+}
+
+func codexProbeAnchorTime(resetAt time.Time) time.Time {
+	return resetAt.UTC().Add(-5 * time.Hour)
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
 }
 
 func (b CodexQuotaBucket) metadataValue() map[string]any {

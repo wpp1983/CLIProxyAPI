@@ -14,6 +14,8 @@ func TestCodexStateRoundTrip(t *testing.T) {
 	fiveHourReset := time.Date(2026, 5, 14, 10, 0, 0, 0, time.UTC)
 	weeklyReset := fiveHourReset.Add(7 * 24 * time.Hour)
 	lastRefresh := fiveHourReset.Add(-15 * time.Minute)
+	probeAt := fiveHourReset.Add(-2 * time.Minute)
+	probeVerifiedAt := fiveHourReset.Add(-1 * time.Minute)
 
 	a := &Auth{}
 	a.SetCodexQuotaState(CodexQuotaState{
@@ -27,9 +29,13 @@ func TestCodexStateRoundTrip(t *testing.T) {
 			Limit:     float64Ptr(120),
 			ResetAt:   &weeklyReset,
 		},
-		LastRefreshAt: &lastRefresh,
-		RefreshStatus: "ok",
-		RefreshError:  "",
+		LastRefreshAt:   &lastRefresh,
+		RefreshStatus:   "ok",
+		RefreshError:    "",
+		ProbeResetAt:    &fiveHourReset,
+		ProbeAt:         &probeAt,
+		ProbeVerifiedAt: &probeVerifiedAt,
+		ProbeStatus:     "verified",
 	})
 	a.SetCodexManualScoreAdjustment(1.25)
 	a.SetCodexComputedScore(7.5)
@@ -47,11 +53,17 @@ func TestCodexStateRoundTrip(t *testing.T) {
 	assertFloatPtr(t, quota.Weekly.Limit, 120)
 	assertTimePtr(t, quota.Weekly.ResetAt, weeklyReset)
 	assertTimePtr(t, quota.LastRefreshAt, lastRefresh)
+	assertTimePtr(t, quota.ProbeResetAt, fiveHourReset)
+	assertTimePtr(t, quota.ProbeAt, probeAt)
+	assertTimePtr(t, quota.ProbeVerifiedAt, probeVerifiedAt)
 	if quota.RefreshStatus != "ok" {
 		t.Fatalf("RefreshStatus = %q, want %q", quota.RefreshStatus, "ok")
 	}
 	if quota.RefreshError != "" {
 		t.Fatalf("RefreshError = %q, want empty", quota.RefreshError)
+	}
+	if quota.ProbeStatus != "verified" {
+		t.Fatalf("ProbeStatus = %q, want verified", quota.ProbeStatus)
 	}
 
 	manual, ok := a.CodexManualScoreAdjustment()
@@ -311,6 +323,92 @@ func TestApplyCodexQuotaBlockedUntil_UpdatesAndClearsCooldownState(t *testing.T)
 	}
 	if a.Quota.Exceeded || a.Quota.Reason != "" || !a.Quota.NextRecoverAt.IsZero() {
 		t.Fatalf("Quota = %#v after clear, want empty quota cooldown state", a.Quota)
+	}
+}
+
+func TestCodexQuotaState_CodexProbeEligibleResetAtUsesAdjustedAnchorWindow(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	withinWindow := now.Add(5*time.Hour - 10*time.Minute)
+	farReset := now.Add(2 * time.Hour)
+	state := CodexQuotaState{
+		FiveHour: CodexQuotaBucket{ResetAt: &withinWindow},
+		Weekly:   CodexQuotaBucket{ResetAt: &farReset},
+	}
+
+	resetAt, ok := state.CodexProbeEligibleResetAt(now)
+	if !ok || resetAt == nil {
+		t.Fatal("CodexProbeEligibleResetAt() = nil/false, want eligible reset")
+	}
+	if !resetAt.Equal(withinWindow) {
+		t.Fatalf("eligible reset = %v, want %v", resetAt, withinWindow)
+	}
+
+	state.ProbeResetAt = &withinWindow
+	resetAt, ok = state.CodexProbeEligibleResetAt(now)
+	if !ok || resetAt == nil || !resetAt.Equal(withinWindow) {
+		t.Fatalf("CodexProbeEligibleResetAt() = %v, %v, want %v/true after same-cycle probe", resetAt, ok, withinWindow)
+	}
+
+	newCycle := now.Add(5*time.Hour + 5*time.Minute)
+	state.FiveHour.ResetAt = &newCycle
+	resetAt, ok = state.CodexProbeEligibleResetAt(now)
+	if !ok || resetAt == nil || !resetAt.Equal(newCycle) {
+		t.Fatalf("CodexProbeEligibleResetAt() after reset change = %v, %v, want %v/true", resetAt, ok, newCycle)
+	}
+
+	outsideWindow := now.Add(5*time.Hour + 15*time.Minute)
+	state.FiveHour.ResetAt = &outsideWindow
+	state.ProbeResetAt = nil
+	if resetAt, ok := state.CodexProbeEligibleResetAt(now); ok || resetAt != nil {
+		t.Fatalf("CodexProbeEligibleResetAt() outside window = %v, %v, want nil/false", resetAt, ok)
+	}
+}
+
+func TestCodexQuotaState_CodexProbeEligibleResetAtPrefersNearestEligibleBucket(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	probedReset := now.Add(5*time.Hour - 5*time.Minute)
+	otherEligibleReset := now.Add(5*time.Hour + 10*time.Minute)
+	state := CodexQuotaState{
+		FiveHour:     CodexQuotaBucket{ResetAt: &probedReset},
+		Weekly:       CodexQuotaBucket{ResetAt: &otherEligibleReset},
+		ProbeResetAt: &probedReset,
+	}
+
+	resetAt, ok := state.CodexProbeEligibleResetAt(now)
+	if !ok || resetAt == nil || !resetAt.Equal(probedReset) {
+		t.Fatalf("CodexProbeEligibleResetAt() = %v, %v, want %v/true", resetAt, ok, probedReset)
+	}
+
+	windowResetAt, ok := state.CodexProbeWindowResetAt(now)
+	if !ok || windowResetAt == nil || !windowResetAt.Equal(probedReset) {
+		t.Fatalf("CodexProbeWindowResetAt() = %v, %v, want %v/true", windowResetAt, ok, probedReset)
+	}
+}
+
+func TestCodexQuotaState_CodexProbeVerifiedForResetRequiresMatchingVerifiedCycle(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Date(2026, 5, 15, 12, 0, 0, 0, time.UTC)
+	verifiedAt := resetAt.Add(2 * time.Minute)
+	state := CodexQuotaState{
+		ProbeResetAt:    &resetAt,
+		ProbeVerifiedAt: &verifiedAt,
+		ProbeStatus:     "verified",
+	}
+	if !state.CodexProbeVerifiedForReset(resetAt) {
+		t.Fatal("CodexProbeVerifiedForReset() = false, want true")
+	}
+	otherReset := resetAt.Add(5 * time.Hour)
+	if state.CodexProbeVerifiedForReset(otherReset) {
+		t.Fatal("CodexProbeVerifiedForReset() = true for different cycle, want false")
+	}
+	state.ProbeStatus = "failed"
+	if state.CodexProbeVerifiedForReset(resetAt) {
+		t.Fatal("CodexProbeVerifiedForReset() = true after failed status, want false")
 	}
 }
 

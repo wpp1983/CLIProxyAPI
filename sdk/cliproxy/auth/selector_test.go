@@ -256,15 +256,15 @@ func TestCodexQuotaScoreSelectorPick_StaysStickyUntilFiveHourExhausted(t *testin
 
 	first := newCodexScoreTestAuth("first", 90, 100, weeklyReset, 0)
 	first.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(10), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(10), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := now.Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
 	second := newCodexScoreTestAuth("second", 80, 100, weeklyReset, 0)
 	second.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(10), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(80), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(10), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(80), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := now.Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
@@ -275,8 +275,8 @@ func TestCodexQuotaScoreSelectorPick_StaysStickyUntilFiveHourExhausted(t *testin
 	}
 
 	second.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(10), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(99), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(10), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(99), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
@@ -287,8 +287,8 @@ func TestCodexQuotaScoreSelectorPick_StaysStickyUntilFiveHourExhausted(t *testin
 	}
 
 	first.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(0), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(0), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
@@ -307,22 +307,22 @@ func TestCodexQuotaScoreSelectorPick_ReleasesStickyOnUnknownFiveHour(t *testing.
 	fiveHourReset := time.Now().Add(2 * time.Hour)
 	first := newCodexScoreTestAuth("first-unknown", 90, 100, weeklyReset, 0)
 	first.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(2), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(2), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
 	second := newCodexScoreTestAuth("second-unknown", 80, 100, weeklyReset, 0)
 	second.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(99), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(99), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
 	_, _ = selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{first, second})
 
 	first.SetCodexQuotaState(CodexQuotaState{
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
@@ -340,15 +340,15 @@ func TestCodexQuotaScoreSelectorPick_ReleasesStickyOnUnavailableOrStale(t *testi
 	fiveHourReset := time.Now().Add(2 * time.Hour)
 	first := newCodexScoreTestAuth("first-state", 90, 100, weeklyReset, 0)
 	first.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(90), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
 	second := newCodexScoreTestAuth("second-state", 80, 100, weeklyReset, 0)
 	second.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(80), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(80), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
@@ -365,15 +365,15 @@ func TestCodexQuotaScoreSelectorPick_ReleasesStickyOnUnavailableOrStale(t *testi
 	first.Unavailable = false
 	first.NextRetryAfter = time.Time{}
 	first.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(95), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(95), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
 	_, _ = selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{first, second})
 	first.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly: CodexQuotaBucket{Remaining: float64Ptr(95), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(95), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-20 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
@@ -392,15 +392,15 @@ func TestCodexQuotaScoreSelectorPick_UpdatesProviderCurrentFromModelSpecificPick
 	fiveHourReset := time.Now().Add(2 * time.Hour)
 	b := newCodexScoreTestAuth("b-auth", 95, 100, weeklyReset, 0)
 	b.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(8), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly:   CodexQuotaBucket{Remaining: float64Ptr(95), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(8), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(95), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
 	l := newCodexScoreTestAuth("l-auth", 60, 100, weeklyReset, 0)
 	l.SetCodexQuotaState(CodexQuotaState{
-		FiveHour: CodexQuotaBucket{Remaining: float64Ptr(8), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
-		Weekly:   CodexQuotaBucket{Remaining: float64Ptr(60), Limit: float64Ptr(100), ResetAt: &weeklyReset},
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(8), Limit: float64Ptr(100), ResetAt: &fiveHourReset},
+		Weekly:        CodexQuotaBucket{Remaining: float64Ptr(60), Limit: float64Ptr(100), ResetAt: &weeklyReset},
 		LastRefreshAt: func() *time.Time { t := time.Now().Add(-1 * time.Minute).UTC(); return &t }(),
 		RefreshStatus: "ok",
 	})
@@ -431,6 +431,33 @@ func TestCodexStickySelectionStateClearPromotesRemainingProviderAuth(t *testing.
 	state.clear(codexStickySelectionKey("codex", "gpt-4.1"))
 	if current := state.currentAuthIDForProvider("codex"); current != "b-auth" {
 		t.Fatalf("currentAuthIDForProvider() after clear = %q, want b-auth", current)
+	}
+}
+
+func TestCodexStickySelectionStateClearAuthRemovesAllStickyReferencesForAuth(t *testing.T) {
+	t.Parallel()
+
+	state := &codexStickySelectionState{byKey: map[string]string{}, byProvider: map[string]string{}}
+	state.set(codexStickySelectionKey("codex", ""), "sticky-auth")
+	state.set(codexStickySelectionKey("codex", "gpt-5.4"), "sticky-auth")
+	state.set(codexStickySelectionKey("codex", "gpt-4.1"), "other-auth")
+
+	state.clearAuth("sticky-auth")
+
+	if got := state.currentAuthIDForProvider("codex"); got != "other-auth" {
+		t.Fatalf("currentAuthIDForProvider() = %q, want other-auth preserved", got)
+	}
+	if got := state.byKey[codexStickySelectionKey("codex", "")]; got != "" {
+		t.Fatalf("provider root sticky = %q, want empty", got)
+	}
+	if got := state.byKey[codexStickySelectionKey("codex", "gpt-5.4")]; got != "" {
+		t.Fatalf("model sticky = %q, want empty", got)
+	}
+	if got := state.byKey[codexStickySelectionKey("codex", "gpt-4.1")]; got != "other-auth" {
+		t.Fatalf("other sticky = %q, want other-auth preserved", got)
+	}
+	if got := state.byProvider["codex"]; got != "other-auth" {
+		t.Fatalf("provider current = %q, want other-auth preserved", got)
 	}
 }
 

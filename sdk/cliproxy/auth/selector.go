@@ -43,8 +43,8 @@ type CodexQuotaScoreSelector struct {
 }
 
 type codexStickySelectionState struct {
-	mu    sync.Mutex
-	byKey map[string]string
+	mu         sync.Mutex
+	byKey      map[string]string
 	byProvider map[string]string
 }
 
@@ -575,6 +575,25 @@ func (s *codexStickySelectionState) clearProvider(provider string) {
 	s.mu.Unlock()
 }
 
+func (s *codexStickySelectionState) clearAuth(authID string) {
+	if s == nil || strings.TrimSpace(authID) == "" {
+		return
+	}
+	targetAuthID := strings.TrimSpace(authID)
+	s.mu.Lock()
+	for key, existingAuthID := range s.byKey {
+		if strings.TrimSpace(existingAuthID) == targetAuthID {
+			delete(s.byKey, key)
+		}
+	}
+	for providerKey, existingAuthID := range s.byProvider {
+		if strings.TrimSpace(existingAuthID) == targetAuthID {
+			delete(s.byProvider, providerKey)
+		}
+	}
+	s.mu.Unlock()
+}
+
 func (s *codexStickySelectionState) clear(key string) {
 	if s == nil || strings.TrimSpace(key) == "" {
 		return
@@ -627,6 +646,10 @@ func providerFromStickySelectionKey(key string) string {
 
 func CurrentCodexStickyAuthID() string {
 	return globalCodexStickySelection.currentAuthIDForProvider("codex")
+}
+
+func ReleaseCodexStickyAuth(authID string) {
+	globalCodexStickySelection.clearAuth(authID)
 }
 
 func RecalculateCurrentCodexStickyAuth(auths []*Auth, now time.Time) *Auth {

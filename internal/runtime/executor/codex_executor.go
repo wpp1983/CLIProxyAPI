@@ -884,12 +884,105 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 			previous.RefreshError = strings.TrimSpace(err.Error())
 			auth.SetCodexQuotaState(previous)
 		} else {
+			verifiedRecovery := false
+			if blockedUntil == nil {
+				if probeResetAt, ok := quotaState.CodexProbeEligibleResetAt(now); ok {
+					quotaState, verifiedRecovery = e.verifyCodexQuotaRecovery(ctx, auth, quotaState, now, *probeResetAt)
+				} else if windowResetAt, ok := quotaState.CodexProbeWindowResetAt(now); ok {
+					verifiedRecovery = quotaState.CodexProbeVerifiedForReset(*windowResetAt)
+				}
+			}
 			auth.SetCodexQuotaState(quotaState)
-			cliproxyauth.ApplyCodexQuotaBlockedUntil(auth, blockedUntil)
+			switch {
+			case blockedUntil != nil:
+				cliproxyauth.ApplyCodexQuotaBlockedUntil(auth, blockedUntil)
+			case verifiedRecovery:
+				cliproxyauth.ApplyCodexQuotaBlockedUntil(auth, nil)
+			}
 		}
 	}
 	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
 	return auth, nil
+}
+
+func (e *CodexExecutor) verifyCodexQuotaRecovery(ctx context.Context, auth *cliproxyauth.Auth, state cliproxyauth.CodexQuotaState, now, resetAt time.Time) (cliproxyauth.CodexQuotaState, bool) {
+	resetAt = resetAt.UTC()
+	probeAt := now.UTC()
+	state.ProbeResetAt = &resetAt
+	state.ProbeAt = &probeAt
+	state.ProbeVerifiedAt = nil
+	state.ProbeStatus = "failed"
+	state.ProbeError = ""
+	if auth != nil {
+		cliproxyauth.ReleaseCodexStickyAuth(auth.ID)
+	}
+
+	if err := e.runCodexQuotaRecoveryProbe(ctx, auth); err != nil {
+		state.ProbeStatus = "failed"
+		state.ProbeError = strings.TrimSpace(err.Error())
+		return state, false
+	}
+
+	state.ProbeVerifiedAt = &probeAt
+	state.ProbeStatus = "verified"
+	state.ProbeError = ""
+	return state, state.CodexProbeVerifiedForReset(resetAt)
+}
+
+func (e *CodexExecutor) runCodexQuotaRecoveryProbe(ctx context.Context, auth *cliproxyauth.Auth) error {
+	token, baseURL := codexCreds(auth)
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("codex recovery probe: access token missing")
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = "https://chatgpt.com/backend-api/codex"
+	}
+	probeURL := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
+	body := []byte(`{"model":"gpt-5.4-mini","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}]}`)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, probeURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("codex recovery probe: build request failed: %w", err)
+	}
+	applyCodexHeaders(httpReq, auth, token, false, e.cfg)
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpResp, err := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("codex recovery probe: request failed: %w", err)
+	}
+	defer closeHTTPResponseBody(httpResp, "codex recovery probe: close response body error")
+	responseBody, err := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("codex recovery probe: read response failed: %w", err)
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return fmt.Errorf("codex recovery probe: %s returned %d: %s", probeURL, httpResp.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+	if !codexProbeUsageEvidence(responseBody) {
+		return fmt.Errorf("codex recovery probe: no usage evidence in successful response")
+	}
+	return nil
+}
+
+func codexProbeUsageEvidence(body []byte) bool {
+	paths := []string{
+		"usage.total_tokens",
+		"usage.prompt_tokens",
+		"usage.input_tokens",
+		"usage.completion_tokens",
+		"usage.output_tokens",
+		"response.usage.total_tokens",
+		"response.usage.prompt_tokens",
+		"response.usage.input_tokens",
+		"response.usage.completion_tokens",
+		"response.usage.output_tokens",
+	}
+	for _, path := range paths {
+		if gjson.GetBytes(body, path).Int() > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 type codexQuotaRefreshPayload struct {
@@ -1153,6 +1246,8 @@ func cloneCodexQuotaState(state cliproxyauth.CodexQuotaState) cliproxyauth.Codex
 	cloned := cliproxyauth.CodexQuotaState{
 		RefreshStatus: state.RefreshStatus,
 		RefreshError:  state.RefreshError,
+		ProbeStatus:   state.ProbeStatus,
+		ProbeError:    state.ProbeError,
 	}
 	if state.FiveHour.Remaining != nil {
 		value := *state.FiveHour.Remaining
@@ -1181,6 +1276,18 @@ func cloneCodexQuotaState(state cliproxyauth.CodexQuotaState) cliproxyauth.Codex
 	if state.LastRefreshAt != nil {
 		value := state.LastRefreshAt.UTC()
 		cloned.LastRefreshAt = &value
+	}
+	if state.ProbeResetAt != nil {
+		value := state.ProbeResetAt.UTC()
+		cloned.ProbeResetAt = &value
+	}
+	if state.ProbeAt != nil {
+		value := state.ProbeAt.UTC()
+		cloned.ProbeAt = &value
+	}
+	if state.ProbeVerifiedAt != nil {
+		value := state.ProbeVerifiedAt.UTC()
+		cloned.ProbeVerifiedAt = &value
 	}
 	return cloned
 }
