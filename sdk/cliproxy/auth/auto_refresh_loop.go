@@ -352,6 +352,16 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		return auth.NextRefreshAfter, true
 	}
 
+	if IsCodexOAuthLikeAuth(auth) {
+		lastRefresh := auth.LastRefreshedAt
+		if lastRefresh.IsZero() {
+			if ts, ok := authLastRefreshTimestamp(auth); ok {
+				lastRefresh = ts
+			}
+		}
+		return nextCodexQuarterHourRefreshTime(now, lastRefresh), true
+	}
+
 	if evaluator, ok := auth.Runtime.(RefreshEvaluator); ok && evaluator != nil {
 		if interval <= 0 {
 			interval = refreshCheckInterval
@@ -412,6 +422,18 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 		return dueAt, true
 	}
 	return now, true
+}
+
+func nextCodexQuarterHourRefreshTime(now, lastRefresh time.Time) time.Time {
+	batchStart := now.Truncate(CodexQuotaRefreshInterval)
+	if lastRefresh.IsZero() || lastRefresh.Before(batchStart) {
+		return now
+	}
+	next := batchStart.Add(CodexQuotaRefreshInterval)
+	if !next.After(now) {
+		return now
+	}
+	return next
 }
 
 type refreshHeapItem struct {

@@ -3988,6 +3988,16 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
 		return false
 	}
+	if IsCodexOAuthLikeAuth(a) {
+		lastRefresh := a.LastRefreshedAt
+		if lastRefresh.IsZero() {
+			if ts, ok := authLastRefreshTimestamp(a); ok {
+				lastRefresh = ts
+			}
+		}
+		batchStart := now.Truncate(CodexQuotaRefreshInterval)
+		return lastRefresh.IsZero() || lastRefresh.Before(batchStart)
+	}
 	if evaluator, ok := a.Runtime.(RefreshEvaluator); ok && evaluator != nil {
 		return evaluator.ShouldRefresh(now, a)
 	}

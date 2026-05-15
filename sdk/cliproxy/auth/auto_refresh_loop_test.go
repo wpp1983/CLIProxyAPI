@@ -158,9 +158,9 @@ func TestNextRefreshCheckAt_RefreshEvaluatorFallback(t *testing.T) {
 	}
 }
 
-func TestNextRefreshCheckAt_CodexOAuthUsesFixedPreferredRefreshInterval(t *testing.T) {
-	now := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
-	lastRefresh := now.Add(-10 * time.Minute)
+func TestNextRefreshCheckAt_CodexOAuthUsesQuarterHourBatchBoundary(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 10, 0, 0, time.UTC)
+	lastRefresh := time.Date(2026, 5, 14, 12, 1, 0, 0, time.UTC)
 	auth := &Auth{
 		ID:              "codex-oauth-refresh-interval",
 		Provider:        "codex",
@@ -179,20 +179,20 @@ func TestNextRefreshCheckAt_CodexOAuthUsesFixedPreferredRefreshInterval(t *testi
 	if !ok {
 		t.Fatal("nextRefreshCheckAt() ok = false, want true")
 	}
-	want := lastRefresh.Add(CodexQuotaRefreshInterval)
+	want := time.Date(2026, 5, 14, 12, 15, 0, 0, time.UTC)
 	if !got.Equal(want) {
 		t.Fatalf("nextRefreshCheckAt() = %s, want %s", got, want)
 	}
 }
 
-func TestNextRefreshCheckAt_CodexOAuthFirstLoadSchedulesImmediately(t *testing.T) {
-	now := time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC)
+func TestNextRefreshCheckAt_CodexOAuthDueWithinCurrentQuarterSchedulesImmediately(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 10, 0, 0, time.UTC)
 	auth := &Auth{
 		ID:       "codex-oauth-first-load",
 		Provider: "codex",
 		Metadata: map[string]any{
 			"email":        "user@example.com",
-			"last_refresh": now.Add(-48 * time.Hour).Format(time.RFC3339),
+			"last_refresh": time.Date(2026, 5, 14, 11, 55, 0, 0, time.UTC).Format(time.RFC3339),
 		},
 	}
 
@@ -203,5 +203,26 @@ func TestNextRefreshCheckAt_CodexOAuthFirstLoadSchedulesImmediately(t *testing.T
 	}
 	if !got.Equal(now) {
 		t.Fatalf("nextRefreshCheckAt() = %s, want immediate refresh at %s", got, now)
+	}
+}
+
+func TestNextRefreshCheckAt_CodexOAuthRefreshedThisQuarterWaitsForNextQuarter(t *testing.T) {
+	now := time.Date(2026, 5, 14, 12, 10, 0, 0, time.UTC)
+	auth := &Auth{
+		ID:       "codex-oauth-same-quarter",
+		Provider: "codex",
+		Metadata: map[string]any{
+			"email":        "user@example.com",
+			"last_refresh": time.Date(2026, 5, 14, 12, 2, 0, 0, time.UTC).Format(time.RFC3339),
+		},
+	}
+	EnsureCodexQuotaRefreshMetadata(auth)
+	got, ok := nextRefreshCheckAt(now, auth, 5*24*time.Hour)
+	if !ok {
+		t.Fatal("nextRefreshCheckAt() ok = false, want true")
+	}
+	want := time.Date(2026, 5, 14, 12, 15, 0, 0, time.UTC)
+	if !got.Equal(want) {
+		t.Fatalf("nextRefreshCheckAt() = %s, want %s", got, want)
 	}
 }
