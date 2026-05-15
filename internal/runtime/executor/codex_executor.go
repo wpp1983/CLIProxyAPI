@@ -970,14 +970,7 @@ func codexQuotaRefreshURLs(baseURL string) []string {
 	if trimmed == "" {
 		trimmed = "https://chatgpt.com/backend-api/codex"
 	}
-	candidates := []string{
-		trimmed + "/usage",
-		trimmed + "/quota",
-		trimmed + "/account",
-	}
-	if backendRoot := codexBackendRoot(trimmed); backendRoot != "" {
-		candidates = append(candidates, backendRoot+"/accounts/check/v4-2023-04-27")
-	}
+	candidates := []string{trimmed + "/usage"}
 	seen := make(map[string]struct{}, len(candidates))
 	out := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -993,26 +986,6 @@ func codexQuotaRefreshURLs(baseURL string) []string {
 	return out
 }
 
-func codexBackendRoot(baseURL string) string {
-	parsed, err := url.Parse(strings.TrimSpace(baseURL))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return ""
-	}
-	path := strings.TrimRight(parsed.EscapedPath(), "/")
-	if idx := strings.Index(path, "/backend-api/codex"); idx >= 0 {
-		parsed.Path = path[:idx] + "/backend-api"
-		parsed.RawPath = ""
-		parsed.RawQuery = ""
-		parsed.Fragment = ""
-		return strings.TrimRight(parsed.String(), "/")
-	}
-	parsed.Path = "/backend-api"
-	parsed.RawPath = ""
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return strings.TrimRight(parsed.String(), "/")
-}
-
 func parseCodexQuotaRefreshPayload(body []byte) (codexQuotaRefreshPayload, bool) {
 	payload := codexQuotaRefreshPayload{}
 	payload.state.FiveHour = parseCodexQuotaBucket(body,
@@ -1023,10 +996,19 @@ func parseCodexQuotaRefreshPayload(body []byte) (codexQuotaRefreshPayload, bool)
 		"quota.weekly", "quota.weekly_window", "weekly", "weekly_window",
 		"usage.weekly", "usage.weekly_window", "ratelimits.weekly", "ratelimits.weekly_window",
 	)
+	if !codexQuotaBucketHasData(payload.state.Weekly) {
+		payload.state.Weekly = parseCodexQuotaBucket(body, "rate_limit.primary_window")
+	}
+	if !codexQuotaBucketHasData(payload.state.FiveHour) {
+		payload.state.FiveHour = parseCodexQuotaBucket(body, "rate_limit.secondary_window")
+	}
+	mergeCodexAdditionalRateLimitBuckets(body, &payload.state)
 	if blockedUntil, ok := firstTimePath(body,
 		"quota_blocked_until", "quota.blocked_until", "quota.blockedUntil",
 		"blocked_until", "blockedUntil", "ratelimits.blocked_until", "ratelimits.blockedUntil",
-		"error.resets_at",
+		"error.resets_at", "rate_limit.blocked_until", "rate_limit.blockedUntil",
+		"rate_limit.primary_window.blocked_until", "rate_limit.primary_window.blockedUntil",
+		"rate_limit.secondary_window.blocked_until", "rate_limit.secondary_window.blockedUntil",
 	); ok {
 		payload.blockedUntil = &blockedUntil
 	}
@@ -1037,17 +1019,27 @@ func parseCodexQuotaBucket(body []byte, prefixes ...string) cliproxyauth.CodexQu
 	for _, prefix := range prefixes {
 		bucket := cliproxyauth.CodexQuotaBucket{}
 		if remaining, ok := firstFloatPath(body,
-			prefix+".remaining", prefix+".remaining_quota", prefix+".available", prefix+".left",
+			codexQuotaFieldPath(prefix, "remaining"),
+			codexQuotaFieldPath(prefix, "remaining_quota"),
+			codexQuotaFieldPath(prefix, "available"),
+			codexQuotaFieldPath(prefix, "left"),
 		); ok {
 			bucket.Remaining = &remaining
 		}
 		if limit, ok := firstFloatPath(body,
-			prefix+".limit", prefix+".quota", prefix+".total", prefix+".max",
+			codexQuotaFieldPath(prefix, "limit"),
+			codexQuotaFieldPath(prefix, "quota"),
+			codexQuotaFieldPath(prefix, "total"),
+			codexQuotaFieldPath(prefix, "max"),
 		); ok {
 			bucket.Limit = &limit
 		}
 		if resetAt, ok := firstTimePath(body,
-			prefix+".reset_at", prefix+".resetAt", prefix+".resets_at", prefix+".resetsAt", prefix+".next_reset_at",
+			codexQuotaFieldPath(prefix, "reset_at"),
+			codexQuotaFieldPath(prefix, "resetAt"),
+			codexQuotaFieldPath(prefix, "resets_at"),
+			codexQuotaFieldPath(prefix, "resetsAt"),
+			codexQuotaFieldPath(prefix, "next_reset_at"),
 		); ok {
 			bucket.ResetAt = &resetAt
 		}
@@ -1056,6 +1048,76 @@ func parseCodexQuotaBucket(body []byte, prefixes ...string) cliproxyauth.CodexQu
 		}
 	}
 	return cliproxyauth.CodexQuotaBucket{}
+}
+
+func codexQuotaFieldPath(prefix, field string) string {
+	prefix = strings.TrimSpace(prefix)
+	field = strings.TrimSpace(field)
+	if prefix == "" {
+		return field
+	}
+	if field == "" {
+		return prefix
+	}
+	return prefix + "." + field
+}
+
+func mergeCodexAdditionalRateLimitBuckets(body []byte, state *cliproxyauth.CodexQuotaState) {
+	if state == nil {
+		return
+	}
+	for _, path := range []string{"rate_limit.additional_rate_limits", "additional_rate_limits"} {
+		result := gjson.GetBytes(body, path)
+		if !result.Exists() {
+			continue
+		}
+		for _, item := range result.Array() {
+			bucket := parseCodexQuotaBucket([]byte(item.Raw), "")
+			if !codexQuotaBucketHasData(bucket) {
+				continue
+			}
+			switch codexQuotaBucketWindowKind([]byte(item.Raw)) {
+			case "weekly":
+				if !codexQuotaBucketHasData(state.Weekly) {
+					state.Weekly = bucket
+				}
+			case "five_hour":
+				if !codexQuotaBucketHasData(state.FiveHour) {
+					state.FiveHour = bucket
+				}
+			}
+		}
+	}
+}
+
+func codexQuotaBucketWindowKind(body []byte) string {
+	label, _ := firstStringPath(body,
+		"name", "key", "id", "window", "window_name", "windowName", "label", "slug",
+	)
+	label = strings.ToLower(strings.TrimSpace(label))
+	if strings.Contains(label, "week") {
+		return "weekly"
+	}
+	if (strings.Contains(label, "five") || strings.Contains(label, "5")) && strings.Contains(label, "hour") {
+		return "five_hour"
+	}
+	if strings.Contains(label, "secondary") {
+		return "five_hour"
+	}
+	if strings.Contains(label, "primary") {
+		return "weekly"
+	}
+	if seconds, ok := firstFloatPath(body,
+		"window_seconds", "duration_seconds", "interval_seconds", "reset_interval_seconds",
+	); ok {
+		switch {
+		case seconds >= 6*24*60*60:
+			return "weekly"
+		case seconds >= 4*60*60 && seconds <= 6*60*60:
+			return "five_hour"
+		}
+	}
+	return ""
 }
 
 func codexQuotaBucketHasData(bucket cliproxyauth.CodexQuotaBucket) bool {
@@ -1135,6 +1197,20 @@ func firstTimePath(body []byte, paths ...string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+func firstStringPath(body []byte, paths ...string) (string, bool) {
+	for _, path := range paths {
+		result := gjson.GetBytes(body, path)
+		if !result.Exists() || result.Type != gjson.String {
+			continue
+		}
+		value := strings.TrimSpace(result.String())
+		if value != "" {
+			return value, true
+		}
+	}
+	return "", false
 }
 
 func cliproxyauthFloatString(raw string) (float64, bool) {
