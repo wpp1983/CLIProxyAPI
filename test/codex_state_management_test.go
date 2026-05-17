@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -243,6 +244,86 @@ func TestGetCodexState(t *testing.T) {
 	}
 	if idToken["plan_type"] != "plus" {
 		t.Fatalf("unexpected plan_type: %#v", idToken["plan_type"])
+	}
+}
+
+func TestGetCodexState_HidesDisabledRemovedFileBackedAuthsButKeepsActiveOnes(t *testing.T) {
+	h, manager, _, oauthAuth, _, _ := newCodexManagementHandler(t)
+
+	activeAuth := &coreauth.Auth{
+		ID:       "codex-oauth-active-2",
+		Provider: "codex",
+		FileName: "codex-active-2.json",
+		Attributes: map[string]string{
+			"path": filepath.Join(t.TempDir(), "codex-active-2.json"),
+		},
+		Metadata: map[string]any{
+			"email":    "active2@example.com",
+			"id_token": fakeCodexJWT("active2@example.com", "acct_456", "pro"),
+		},
+		Status: coreauth.StatusActive,
+	}
+	if err := os.WriteFile(activeAuth.Attributes["path"], []byte(`{"provider":"codex"}`), 0o644); err != nil {
+		t.Fatalf("write active auth file: %v", err)
+	}
+	if _, err := manager.Register(context.Background(), activeAuth); err != nil {
+		t.Fatalf("register second active auth: %v", err)
+	}
+
+	removedAuth := &coreauth.Auth{
+		ID:       "codex-oauth-removed",
+		Provider: "codex",
+		FileName: "codex-removed.json",
+		Attributes: map[string]string{
+			"path": filepath.Join(t.TempDir(), "codex-removed.json"),
+		},
+		Metadata: map[string]any{
+			"email":    "c@tang.ee",
+			"id_token": fakeCodexJWT("c@tang.ee", "acct_removed", "plus"),
+		},
+		Disabled:      true,
+		Status:        coreauth.StatusDisabled,
+		StatusMessage: "removed via management API",
+	}
+	if _, err := manager.Register(context.Background(), removedAuth); err != nil {
+		t.Fatalf("register removed auth: %v", err)
+	}
+
+	r := setupCodexManagementRouter(h)
+	req := httptest.NewRequest(http.MethodGet, "/v0/management/codex-state", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+
+	var resp map[string][]map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	items := resp["codex-state"]
+	if len(items) != 2 {
+		t.Fatalf("expected 2 active codex runtime auths, got %d", len(items))
+	}
+
+	seen := map[string]bool{}
+	for _, item := range items {
+		if id, _ := item["id"].(string); id != "" {
+			seen[id] = true
+		}
+		if email, _ := item["email"].(string); email == "c@tang.ee" {
+			t.Fatalf("expected removed auth email to be hidden, got response item %#v", item)
+		}
+	}
+	if !seen[oauthAuth.ID] {
+		t.Fatalf("expected original active auth %q to remain visible", oauthAuth.ID)
+	}
+	if !seen[activeAuth.ID] {
+		t.Fatalf("expected second active auth %q to remain visible", activeAuth.ID)
+	}
+	if seen[removedAuth.ID] {
+		t.Fatalf("expected removed auth %q to be hidden", removedAuth.ID)
 	}
 }
 

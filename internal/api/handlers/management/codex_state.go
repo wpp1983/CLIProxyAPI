@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -197,7 +198,7 @@ func (h *Handler) findManagedCodexAuth(id, name, authIndex string) (*coreauth.Au
 }
 
 func buildCodexStateEntry(auth *coreauth.Auth) gin.H {
-	if auth == nil || !coreauth.IsCodexOAuthLikeAuth(auth) {
+	if shouldHideCodexStateAuth(auth) {
 		return nil
 	}
 	auth.EnsureIndex()
@@ -244,6 +245,26 @@ func buildCodexStateEntry(auth *coreauth.Auth) gin.H {
 		entry["id_token"] = claims
 	}
 	return entry
+}
+
+func shouldHideCodexStateAuth(auth *coreauth.Auth) bool {
+	if auth == nil || !coreauth.IsCodexOAuthLikeAuth(auth) {
+		return true
+	}
+	if isRuntimeOnlyAuth(auth) {
+		return false
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return true
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if path == "" {
+		return false
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) && strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api") {
+		return true
+	}
+	return false
 }
 
 func buildCodexStateAccountLabel(auth *coreauth.Auth) string {
