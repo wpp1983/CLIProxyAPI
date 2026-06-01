@@ -13,6 +13,33 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
+func TestCodexQuotaRefreshURLs_UsesWhamUsageEndpoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		baseURL string
+		want    string
+	}{
+		{name: "default", want: "https://chatgpt.com/backend-api/wham/usage"},
+		{name: "codex base", baseURL: "https://chatgpt.com/backend-api/codex", want: "https://chatgpt.com/backend-api/wham/usage"},
+		{name: "legacy codex usage", baseURL: "https://chatgpt.com/backend-api/codex/usage", want: "https://chatgpt.com/backend-api/wham/usage"},
+		{name: "wham base", baseURL: "https://chatgpt.com/backend-api/wham", want: "https://chatgpt.com/backend-api/wham/usage"},
+		{name: "wham usage", baseURL: "https://chatgpt.com/backend-api/wham/usage", want: "https://chatgpt.com/backend-api/wham/usage"},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := codexQuotaRefreshURLs(tt.baseURL)
+			if len(got) != 1 || got[0] != tt.want {
+				t.Fatalf("codexQuotaRefreshURLs(%q) = %#v, want [%q]", tt.baseURL, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCodexExecutorRefresh_MapsQuotaStateAndCooldown(t *testing.T) {
 	t.Parallel()
 
@@ -21,7 +48,7 @@ func TestCodexExecutorRefresh_MapsQuotaStateAndCooldown(t *testing.T) {
 	fiveHourReset := time.Now().Add(2 * time.Hour).UTC().Truncate(time.Second)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/backend-api/codex/usage":
+		case "/backend-api/wham/usage":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"quota":{"five_hour":{"remaining":4,"limit":40,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `"},"weekly":{"remaining":80,"limit":100,"reset_at":"` + weeklyReset.Format(time.RFC3339) + `"},"blocked_until":"` + blockedUntil.Format(time.RFC3339) + `"}}`))
 		default:
@@ -80,7 +107,7 @@ func TestCodexExecutorRefresh_MapsQuotaStateAndCooldown(t *testing.T) {
 	}
 }
 
-func TestCodexExecutorRefresh_UsesUsageEndpointAndParsesUsageWindows(t *testing.T) {
+func TestCodexExecutorRefresh_UsesWhamUsageEndpointAndParsesUsageWindows(t *testing.T) {
 	t.Parallel()
 
 	blockedUntil := time.Now().Add(25 * time.Minute).UTC().Truncate(time.Second)
@@ -90,8 +117,24 @@ func TestCodexExecutorRefresh_UsesUsageEndpointAndParsesUsageWindows(t *testing.
 	var otherRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/backend-api/codex/usage":
+		case "/backend-api/wham/usage":
 			usageRequests.Add(1)
+			if got := r.Header.Get("Authorization"); got != "Bearer token-123" {
+				http.Error(w, "bad authorization header: "+got, http.StatusBadRequest)
+				return
+			}
+			if got := r.Header.Get("User-Agent"); got != codexQuotaRefreshUserAgent {
+				http.Error(w, "bad user-agent header: "+got, http.StatusBadRequest)
+				return
+			}
+			if got := r.Header.Get("Chatgpt-Account-Id"); got != "acct-123" {
+				http.Error(w, "bad account header: "+got, http.StatusBadRequest)
+				return
+			}
+			if got := r.Header.Get("Originator"); got != "" {
+				http.Error(w, "unexpected originator header: "+got, http.StatusBadRequest)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":19,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `","blocked_until":"` + blockedUntil.Format(time.RFC3339) + `"},"secondary_window":{"used_percent":42,"reset_after_seconds":518400},"additional_rate_limits":[{"window_name":"weekly","remaining":3,"limit":9,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `"},{"window_name":"five_hour","remaining":1,"limit":9,"reset_at":"` + weeklyReset.Format(time.RFC3339) + `"}]}}`))
 		default:
@@ -107,6 +150,7 @@ func TestCodexExecutorRefresh_UsesUsageEndpointAndParsesUsageWindows(t *testing.
 		Metadata: map[string]any{
 			"email":        "user@example.com",
 			"access_token": "token-123",
+			"account_id":   "acct-123",
 		},
 		Attributes: map[string]string{
 			"base_url": server.URL + "/backend-api/codex",
@@ -150,6 +194,31 @@ func TestCodexExecutorRefresh_UsesUsageEndpointAndParsesUsageWindows(t *testing.
 	}
 }
 
+func TestParseCodexQuotaRefreshPayload_ClassifiesWindowsByDuration(t *testing.T) {
+	t.Parallel()
+
+	fiveHourReset := time.Now().Add(5 * time.Hour).UTC().Truncate(time.Second)
+	weeklyReset := time.Now().Add(7 * 24 * time.Hour).UTC().Truncate(time.Second)
+	body := []byte(`{"rate_limit":{"primary_window":{"used_percent":66,"limit_window_seconds":604800,"reset_at":"` + weeklyReset.Format(time.RFC3339) + `"},"secondary_window":{"used_percent":25,"limit_window_seconds":18000,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `"}}}`)
+
+	payload, ok := parseCodexQuotaRefreshPayload(body)
+	if !ok {
+		t.Fatal("parseCodexQuotaRefreshPayload() ok = false, want true")
+	}
+	if payload.state.FiveHour.Remaining == nil || *payload.state.FiveHour.Remaining != 75 {
+		t.Fatalf("FiveHour.Remaining = %#v, want 75 from 5h window", payload.state.FiveHour.Remaining)
+	}
+	if payload.state.Weekly.Remaining == nil || *payload.state.Weekly.Remaining != 34 {
+		t.Fatalf("Weekly.Remaining = %#v, want 34 from weekly window", payload.state.Weekly.Remaining)
+	}
+	if payload.state.FiveHour.ResetAt == nil || !payload.state.FiveHour.ResetAt.Equal(fiveHourReset) {
+		t.Fatalf("FiveHour.ResetAt = %v, want %v", payload.state.FiveHour.ResetAt, fiveHourReset)
+	}
+	if payload.state.Weekly.ResetAt == nil || !payload.state.Weekly.ResetAt.Equal(weeklyReset) {
+		t.Fatalf("Weekly.ResetAt = %v, want %v", payload.state.Weekly.ResetAt, weeklyReset)
+	}
+}
+
 func TestCodexExecutorRefresh_UsesAdditionalRateLimitsOnlyAsFallback(t *testing.T) {
 	t.Parallel()
 
@@ -157,7 +226,7 @@ func TestCodexExecutorRefresh_UsesAdditionalRateLimitsOnlyAsFallback(t *testing.
 	fiveHourReset := time.Now().Add(5 * time.Hour).UTC().Truncate(time.Second)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/backend-api/codex/usage":
+		case "/backend-api/wham/usage":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"rate_limit":{"primary_window":{"remaining":9,"limit":40,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `"},"secondary_window":{"remaining":70,"limit":100,"reset_at":"` + weeklyReset.Format(time.RFC3339) + `"},"additional_rate_limits":[{"window_name":"weekly","remaining":1,"limit":2,"reset_at":"` + fiveHourReset.Format(time.RFC3339) + `"},{"window_name":"five_hour","remaining":2,"limit":3,"reset_at":"` + weeklyReset.Format(time.RFC3339) + `"}]}}`))
 		default:
@@ -319,7 +388,7 @@ func TestCodexExecutorRefresh_HealthyInWindowSendsProbe(t *testing.T) {
 	var probeBody atomic.Value
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/backend-api/codex/usage":
+		case "/backend-api/wham/usage":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"quota":{"five_hour":{"remaining":12,"limit":40,"reset_at":"` + nowReset.Format(time.RFC3339) + `"},"weekly":{"remaining":88,"limit":100,"reset_at":"` + nowReset.Add(6*24*time.Hour).Format(time.RFC3339) + `"}}}`))
 		case "/backend-api/codex/responses/compact":
@@ -390,7 +459,7 @@ func TestCodexExecutorRefresh_ProbeWindowReleasesStickyCodexAuthBeforeProbe(t *t
 	stickyDuringProbe.Store("")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/backend-api/codex/usage":
+		case "/backend-api/wham/usage":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"quota":{"five_hour":{"remaining":12,"limit":40,"reset_at":"` + nowReset.Format(time.RFC3339) + `"},"weekly":{"remaining":88,"limit":100,"reset_at":"` + nowReset.Add(6*24*time.Hour).Format(time.RFC3339) + `"}}}`))
 		case "/backend-api/codex/responses/compact":
@@ -445,7 +514,7 @@ func TestCodexExecutorRefresh_PreservesCooldownUntilProbeVerifiesRecovery(t *tes
 	var probeRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/backend-api/codex/usage":
+		case "/backend-api/wham/usage":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"quota":{"five_hour":{"remaining":10,"limit":40,"reset_at":"` + nowReset.Format(time.RFC3339) + `"},"weekly":{"remaining":80,"limit":100,"reset_at":"` + nowReset.Add(6*24*time.Hour).Format(time.RFC3339) + `"}}}`))
 		case "/backend-api/codex/responses/compact":
@@ -512,7 +581,7 @@ func TestCodexExecutorRefresh_VerifiedProbeClearsCooldownAndReprobesSameResetCyc
 	var probeRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/backend-api/codex/usage":
+		case "/backend-api/wham/usage":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"quota":{"five_hour":{"remaining":12,"limit":40,"reset_at":"` + nowReset.Format(time.RFC3339) + `"},"weekly":{"remaining":88,"limit":100,"reset_at":"` + nowReset.Add(6*24*time.Hour).Format(time.RFC3339) + `"}}}`))
 		case "/backend-api/codex/responses/compact":
@@ -596,7 +665,7 @@ func TestCodexExecutorRefresh_NewResetCycleTriggersNewProbe(t *testing.T) {
 	var usageRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/backend-api/codex/usage":
+		case "/backend-api/wham/usage":
 			count := usageRequests.Add(1)
 			resetAt := firstReset
 			if count > 1 {
@@ -668,7 +737,7 @@ func TestCodexExecutorRefresh_ReprobesNearestEligibleWindowEvenWhenAlreadyProbed
 	var probeRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/backend-api/codex/usage":
+		case "/backend-api/wham/usage":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"quota":{"five_hour":{"remaining":12,"limit":40,"reset_at":"` + probedReset.Format(time.RFC3339) + `"},"weekly":{"remaining":88,"limit":100,"reset_at":"` + otherEligibleReset.Format(time.RFC3339) + `"}}}`))
 		case "/backend-api/codex/responses/compact":

@@ -32,6 +32,7 @@ import (
 
 const (
 	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
+	codexQuotaRefreshUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 	codexOriginator            = "codex-tui"
 	codexDefaultImageToolModel = "gpt-image-2"
 )
@@ -1041,7 +1042,7 @@ func (e *CodexExecutor) fetchCodexQuotaRefreshDocument(ctx context.Context, auth
 	if err != nil {
 		return nil, fmt.Errorf("codex quota refresh: build request %s: %w", rawURL, err)
 	}
-	applyCodexHeaders(httpReq, auth, token, false, e.cfg)
+	applyCodexQuotaRefreshHeaders(httpReq, auth, token)
 	httpReq.Header.Set("Accept", "application/json")
 	httpResp, err := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
 	if err != nil {
@@ -1058,12 +1059,29 @@ func (e *CodexExecutor) fetchCodexQuotaRefreshDocument(ctx context.Context, auth
 	return body, nil
 }
 
+func applyCodexQuotaRefreshHeaders(r *http.Request, auth *cliproxyauth.Auth, token string) {
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "application/json")
+	r.Header.Set("User-Agent", codexQuotaRefreshUserAgent)
+	if auth != nil && auth.Metadata != nil {
+		if accountID, ok := auth.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
+			r.Header.Set("Chatgpt-Account-Id", accountID)
+		}
+	}
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(r, attrs)
+}
+
 func codexQuotaRefreshURLs(baseURL string) []string {
 	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if trimmed == "" {
 		trimmed = "https://chatgpt.com/backend-api/codex"
 	}
-	candidates := []string{trimmed + "/usage"}
+	candidates := []string{codexQuotaUsageURLFromBase(trimmed)}
 	seen := make(map[string]struct{}, len(candidates))
 	out := make([]string, 0, len(candidates))
 	for _, candidate := range candidates {
@@ -1079,6 +1097,38 @@ func codexQuotaRefreshURLs(baseURL string) []string {
 	return out
 }
 
+func codexQuotaUsageURLFromBase(baseURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if trimmed == "" {
+		return "https://chatgpt.com/backend-api/wham/usage"
+	}
+	if base, ok := trimSuffixFold(trimmed, "/codex/usage"); ok {
+		return base + "/wham/usage"
+	}
+	if base, ok := trimSuffixFold(trimmed, "/usage"); ok {
+		if _, ok := trimSuffixFold(base, "/wham"); ok {
+			return trimmed
+		}
+	}
+	if base, ok := trimSuffixFold(trimmed, "/codex"); ok {
+		return base + "/wham/usage"
+	}
+	if _, ok := trimSuffixFold(trimmed, "/wham"); ok {
+		return trimmed + "/usage"
+	}
+	if _, ok := trimSuffixFold(trimmed, "/backend-api"); ok {
+		return trimmed + "/wham/usage"
+	}
+	return trimmed + "/usage"
+}
+
+func trimSuffixFold(value, suffix string) (string, bool) {
+	if !strings.HasSuffix(strings.ToLower(value), strings.ToLower(suffix)) {
+		return value, false
+	}
+	return value[:len(value)-len(suffix)], true
+}
+
 func parseCodexQuotaRefreshPayload(body []byte) (codexQuotaRefreshPayload, bool) {
 	payload := codexQuotaRefreshPayload{}
 	now := time.Now().UTC()
@@ -1091,10 +1141,16 @@ func parseCodexQuotaRefreshPayload(body []byte) (codexQuotaRefreshPayload, bool)
 		"usage.weekly", "usage.weekly_window", "ratelimits.weekly", "ratelimits.weekly_window",
 	)
 	if !codexQuotaBucketHasData(payload.state.Weekly) {
-		payload.state.Weekly = parseCodexQuotaBucketAt(body, now, "rate_limit.secondary_window")
+		payload.state.Weekly = parseCodexQuotaWindowByDuration(body, now, "rate_limit", 7*24*time.Hour)
+		if !codexQuotaBucketHasData(payload.state.Weekly) {
+			payload.state.Weekly = parseCodexQuotaBucketAt(body, now, "rate_limit.secondary_window")
+		}
 	}
 	if !codexQuotaBucketHasData(payload.state.FiveHour) {
-		payload.state.FiveHour = parseCodexQuotaBucketAt(body, now, "rate_limit.primary_window")
+		payload.state.FiveHour = parseCodexQuotaWindowByDuration(body, now, "rate_limit", 5*time.Hour)
+		if !codexQuotaBucketHasData(payload.state.FiveHour) {
+			payload.state.FiveHour = parseCodexQuotaBucketAt(body, now, "rate_limit.primary_window")
+		}
 	}
 	mergeCodexAdditionalRateLimitBuckets(body, &payload.state)
 	if blockedUntil, ok := firstTimePath(body,
@@ -1168,6 +1224,25 @@ func parseCodexQuotaBucketAt(body []byte, now time.Time, prefixes ...string) cli
 	return cliproxyauth.CodexQuotaBucket{}
 }
 
+func parseCodexQuotaWindowByDuration(body []byte, now time.Time, prefix string, target time.Duration) cliproxyauth.CodexQuotaBucket {
+	for _, windowName := range []string{"primary_window", "primaryWindow", "secondary_window", "secondaryWindow"} {
+		path := codexQuotaFieldPath(prefix, windowName)
+		result := gjson.GetBytes(body, path)
+		if !result.Exists() {
+			continue
+		}
+		seconds, ok := firstFloatPath([]byte(result.Raw), "limit_window_seconds", "limitWindowSeconds")
+		if !ok || time.Duration(seconds*float64(time.Second)) != target {
+			continue
+		}
+		bucket := parseCodexQuotaBucketAt([]byte(result.Raw), now, "")
+		if codexQuotaBucketHasData(bucket) {
+			return bucket
+		}
+	}
+	return cliproxyauth.CodexQuotaBucket{}
+}
+
 func codexQuotaFieldPath(prefix, field string) string {
 	prefix = strings.TrimSpace(prefix)
 	field = strings.TrimSpace(field)
@@ -1220,13 +1295,13 @@ func codexQuotaBucketWindowKind(body []byte) string {
 		return "five_hour"
 	}
 	if strings.Contains(label, "secondary") {
-		return "five_hour"
-	}
-	if strings.Contains(label, "primary") {
 		return "weekly"
 	}
+	if strings.Contains(label, "primary") {
+		return "five_hour"
+	}
 	if seconds, ok := firstFloatPath(body,
-		"window_seconds", "duration_seconds", "interval_seconds", "reset_interval_seconds",
+		"window_seconds", "duration_seconds", "interval_seconds", "reset_interval_seconds", "limit_window_seconds", "limitWindowSeconds",
 	); ok {
 		switch {
 		case seconds >= 6*24*60*60:
