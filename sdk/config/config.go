@@ -48,6 +48,10 @@ func NormalizeRoutingStrategy(strategy string) string {
 	return internalconfig.NormalizeRoutingStrategy(strategy)
 }
 
+func NormalizeRoutingPercent(percent float64) float64 {
+	return internalconfig.NormalizeRoutingPercent(percent)
+}
+
 func SaveConfigPreserveComments(configFile string, cfg *Config) error {
 	return internalconfig.SaveConfigPreserveComments(configFile, cfg)
 }

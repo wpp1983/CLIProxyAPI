@@ -29,8 +29,12 @@ func TestSelectorFromRoutingConfig(t *testing.T) {
 					t.Fatalf("selector type = %T, want RoundRobinSelector", got)
 				}
 			case *coreauth.FillFirstSelector:
-				if _, ok := got.(*coreauth.FillFirstSelector); !ok {
+				fillFirst, ok := got.(*coreauth.FillFirstSelector)
+				if !ok {
 					t.Fatalf("selector type = %T, want FillFirstSelector", got)
+				}
+				if tc.cfg != nil && tc.cfg.Routing.FillFirstThresholdPercent != 0 && fillFirst.ThresholdPercent != tc.cfg.Routing.FillFirstThresholdPercent {
+					t.Fatalf("FillFirstSelector.ThresholdPercent = %v, want %v", fillFirst.ThresholdPercent, tc.cfg.Routing.FillFirstThresholdPercent)
 				}
 			case *coreauth.CodexQuotaScoreSelector:
 				if _, ok := got.(*coreauth.CodexQuotaScoreSelector); !ok {
@@ -38,6 +42,22 @@ func TestSelectorFromRoutingConfig(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSelectorFromRoutingConfig_FillFirstThreshold(t *testing.T) {
+	t.Parallel()
+
+	got := selectorFromRoutingConfig(&config.Config{Routing: config.RoutingConfig{
+		Strategy:                  "fill-first",
+		FillFirstThresholdPercent: 90,
+	}})
+	fillFirst, ok := got.(*coreauth.FillFirstSelector)
+	if !ok {
+		t.Fatalf("selector type = %T, want FillFirstSelector", got)
+	}
+	if fillFirst.ThresholdPercent != 90 {
+		t.Fatalf("ThresholdPercent = %v, want 90", fillFirst.ThresholdPercent)
 	}
 }
 

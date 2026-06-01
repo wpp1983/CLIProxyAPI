@@ -119,6 +119,33 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_FillFirstSkipsCodexOverQuotaThreshold(t *testing.T) {
+	t.Parallel()
+
+	refreshAt := time.Now().Add(-1 * time.Minute).UTC()
+	first := &Auth{ID: "a-first", Provider: "codex"}
+	first.SetCodexQuotaState(CodexQuotaState{
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(9), Limit: float64Ptr(100)},
+		LastRefreshAt: &refreshAt,
+		RefreshStatus: "ok",
+	})
+	second := &Auth{ID: "b-second", Provider: "codex"}
+	second.SetCodexQuotaState(CodexQuotaState{
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(40), Limit: float64Ptr(100)},
+		LastRefreshAt: &refreshAt,
+		RefreshStatus: "ok",
+	})
+	scheduler := newSchedulerForTest(&FillFirstSelector{ThresholdPercent: 90}, second, first)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "b-second" {
+		t.Fatalf("pickSingle() auth = %#v, want b-second", got)
+	}
+}
+
 func TestSchedulerPick_CodexQuotaScorePrefersBestCodexCandidate(t *testing.T) {
 	t.Parallel()
 
@@ -511,6 +538,11 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	manager.SetSelector(&FillFirstSelector{})
 	if manager.scheduler.strategy != schedulerStrategyFillFirst {
 		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
+	}
+
+	manager.SetSelector(&FillFirstSelector{ThresholdPercent: 90})
+	if manager.scheduler.fillFirstThresholdPercent != 90 {
+		t.Fatalf("manager.scheduler.fillFirstThresholdPercent = %v, want 90", manager.scheduler.fillFirstThresholdPercent)
 	}
 }
 

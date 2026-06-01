@@ -33,7 +33,11 @@ type RoundRobinSelector struct {
 // FillFirstSelector selects the first available credential (deterministic ordering).
 // This "burns" one account before moving to the next, which can help stagger
 // rolling-window subscription caps (e.g. chat message limits).
-type FillFirstSelector struct{}
+type FillFirstSelector struct {
+	// ThresholdPercent skips Codex credentials with known quota windows once
+	// usage reaches this percentage. 0 keeps legacy fill-first behavior.
+	ThresholdPercent float64
+}
 
 // CodexQuotaScoreSelector applies Codex quota-aware ranking when every candidate
 // in the active slice is a Codex auth. Otherwise it falls back to round-robin.
@@ -382,7 +386,50 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = applyFillFirstQuotaThreshold(available, s.ThresholdPercent, now)
 	return available[0], nil
+}
+
+func applyFillFirstQuotaThreshold(auths []*Auth, thresholdPercent float64, now time.Time) []*Auth {
+	if len(auths) <= 1 || thresholdPercent <= 0 {
+		return auths
+	}
+	kept := make([]*Auth, 0, len(auths))
+	skipped := 0
+	for _, auth := range auths {
+		if shouldSkipForFillFirstQuotaThreshold(auth, thresholdPercent, now) {
+			skipped++
+			continue
+		}
+		kept = append(kept, auth)
+	}
+	if len(kept) == 0 || skipped == 0 {
+		return auths
+	}
+	return kept
+}
+
+func shouldSkipForFillFirstQuotaThreshold(auth *Auth, thresholdPercent float64, now time.Time) bool {
+	if auth == nil || !IsCodexOAuthLikeAuth(auth) {
+		return false
+	}
+	quota, ok := auth.GetCodexQuotaState()
+	if !ok || !codexQuotaRefreshStateUsable(quota, now) {
+		return false
+	}
+	return codexQuotaBucketUsedPercentAtOrAbove(quota.FiveHour, thresholdPercent) ||
+		codexQuotaBucketUsedPercentAtOrAbove(quota.Weekly, thresholdPercent)
+}
+
+func codexQuotaBucketUsedPercentAtOrAbove(bucket CodexQuotaBucket, thresholdPercent float64) bool {
+	if bucket.Remaining == nil || bucket.Limit == nil || *bucket.Limit <= 0 {
+		return false
+	}
+	used := *bucket.Limit - *bucket.Remaining
+	if used < 0 {
+		used = 0
+	}
+	return (used / *bucket.Limit * 100) >= thresholdPercent
 }
 
 func (s *CodexQuotaScoreSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {

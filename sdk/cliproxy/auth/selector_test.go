@@ -52,6 +52,61 @@ func TestFillFirstSelectorPick_Deterministic(t *testing.T) {
 	}
 }
 
+func TestFillFirstSelectorPick_SkipsCodexOverQuotaThreshold(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	refreshAt := now.Add(-1 * time.Minute)
+	selector := &FillFirstSelector{ThresholdPercent: 90}
+	first := &Auth{ID: "a-first", Provider: "codex"}
+	first.SetCodexQuotaState(CodexQuotaState{
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(9), Limit: float64Ptr(100)},
+		LastRefreshAt: &refreshAt,
+		RefreshStatus: "ok",
+	})
+	second := &Auth{ID: "b-second", Provider: "codex"}
+	second.SetCodexQuotaState(CodexQuotaState{
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(40), Limit: float64Ptr(100)},
+		LastRefreshAt: &refreshAt,
+		RefreshStatus: "ok",
+	})
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{second, first})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "b-second" {
+		t.Fatalf("Pick() auth = %#v, want b-second", got)
+	}
+}
+
+func TestFillFirstSelectorPick_UsesFirstWhenAllCodexOverQuotaThreshold(t *testing.T) {
+	t.Parallel()
+
+	refreshAt := time.Now().Add(-1 * time.Minute).UTC()
+	selector := &FillFirstSelector{ThresholdPercent: 90}
+	first := &Auth{ID: "a-first", Provider: "codex"}
+	first.SetCodexQuotaState(CodexQuotaState{
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(9), Limit: float64Ptr(100)},
+		LastRefreshAt: &refreshAt,
+		RefreshStatus: "ok",
+	})
+	second := &Auth{ID: "b-second", Provider: "codex"}
+	second.SetCodexQuotaState(CodexQuotaState{
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(5), Limit: float64Ptr(100)},
+		LastRefreshAt: &refreshAt,
+		RefreshStatus: "ok",
+	})
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{second, first})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "a-first" {
+		t.Fatalf("Pick() auth = %#v, want a-first fallback", got)
+	}
+}
+
 func TestRoundRobinSelectorPick_CyclesDeterministic(t *testing.T) {
 	t.Parallel()
 
