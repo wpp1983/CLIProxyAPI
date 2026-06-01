@@ -19,7 +19,7 @@ func selectorFromRoutingConfig(cfg *config.Config) coreauth.Selector {
 	case "fill-first":
 		selector = &coreauth.FillFirstSelector{ThresholdPercent: config.NormalizeRoutingPercent(cfg.Routing.FillFirstThresholdPercent)}
 	case "codex-quota-score":
-		selector = &coreauth.CodexQuotaScoreSelector{}
+		selector = &coreauth.CodexQuotaScoreSelector{ThresholdPercent: config.NormalizeRoutingPercent(cfg.Routing.CodexQuotaScoreThresholdPercent)}
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}

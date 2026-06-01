@@ -69,3 +69,15 @@ func TestParseConfigBytes_NormalizesFillFirstThresholdPercent(t *testing.T) {
 		t.Fatalf("Routing.FillFirstThresholdPercent = %v, want 100", cfg.Routing.FillFirstThresholdPercent)
 	}
 }
+
+func TestParseConfigBytes_NormalizesCodexQuotaScoreThresholdPercent(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := ParseConfigBytes([]byte("routing:\n  strategy: codex-quota-score\n  codex-quota-score-threshold-percent: 120\n"))
+	if err != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", err)
+	}
+	if cfg.Routing.CodexQuotaScoreThresholdPercent != 100 {
+		t.Fatalf("Routing.CodexQuotaScoreThresholdPercent = %v, want 100", cfg.Routing.CodexQuotaScoreThresholdPercent)
+	}
+}

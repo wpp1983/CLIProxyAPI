@@ -213,6 +213,46 @@ func TestCodexQuotaScoreSelectorPick_UsesTieBreakers(t *testing.T) {
 	}
 }
 
+func TestCodexQuotaScoreSelectorPick_SkipsCodexOverQuotaThreshold(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(10 * time.Hour)
+	selector := &CodexQuotaScoreSelector{
+		ThresholdPercent: 90,
+		sticky:           &codexStickySelectionState{byKey: map[string]string{}},
+	}
+	overThresholdHighScore := newCodexScoreTestAuth("over-threshold", 5, 100, resetAt, 100)
+	underThresholdLowerScore := newCodexScoreTestAuth("under-threshold", 50, 100, resetAt, 0)
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{overThresholdHighScore, underThresholdLowerScore})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "under-threshold" {
+		t.Fatalf("Pick() auth = %#v, want under-threshold", got)
+	}
+}
+
+func TestCodexQuotaScoreSelectorPick_UsesBestWhenAllCodexOverQuotaThreshold(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(10 * time.Hour)
+	selector := &CodexQuotaScoreSelector{
+		ThresholdPercent: 90,
+		sticky:           &codexStickySelectionState{byKey: map[string]string{}},
+	}
+	highScore := newCodexScoreTestAuth("high-score", 1, 100, resetAt, 100)
+	lowScore := newCodexScoreTestAuth("low-score", 2, 100, resetAt, 0)
+
+	got, err := selector.Pick(context.Background(), "codex", "", cliproxyexecutor.Options{}, []*Auth{lowScore, highScore})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil || got.ID != "high-score" {
+		t.Fatalf("Pick() auth = %#v, want high-score fallback", got)
+	}
+}
+
 func TestCodexQuotaScoreSelectorPick_MixedNonCodexFallsBackToRoundRobin(t *testing.T) {
 	t.Parallel()
 

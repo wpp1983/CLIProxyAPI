@@ -37,8 +37,12 @@ func TestSelectorFromRoutingConfig(t *testing.T) {
 					t.Fatalf("FillFirstSelector.ThresholdPercent = %v, want %v", fillFirst.ThresholdPercent, tc.cfg.Routing.FillFirstThresholdPercent)
 				}
 			case *coreauth.CodexQuotaScoreSelector:
-				if _, ok := got.(*coreauth.CodexQuotaScoreSelector); !ok {
+				codexQuotaScore, ok := got.(*coreauth.CodexQuotaScoreSelector)
+				if !ok {
 					t.Fatalf("selector type = %T, want CodexQuotaScoreSelector", got)
+				}
+				if tc.cfg != nil && tc.cfg.Routing.CodexQuotaScoreThresholdPercent != 0 && codexQuotaScore.ThresholdPercent != tc.cfg.Routing.CodexQuotaScoreThresholdPercent {
+					t.Fatalf("CodexQuotaScoreSelector.ThresholdPercent = %v, want %v", codexQuotaScore.ThresholdPercent, tc.cfg.Routing.CodexQuotaScoreThresholdPercent)
 				}
 			}
 		})
@@ -58,6 +62,22 @@ func TestSelectorFromRoutingConfig_FillFirstThreshold(t *testing.T) {
 	}
 	if fillFirst.ThresholdPercent != 90 {
 		t.Fatalf("ThresholdPercent = %v, want 90", fillFirst.ThresholdPercent)
+	}
+}
+
+func TestSelectorFromRoutingConfig_CodexQuotaScoreThreshold(t *testing.T) {
+	t.Parallel()
+
+	got := selectorFromRoutingConfig(&config.Config{Routing: config.RoutingConfig{
+		Strategy:                        "codex-quota-score",
+		CodexQuotaScoreThresholdPercent: 90,
+	}})
+	codexQuotaScore, ok := got.(*coreauth.CodexQuotaScoreSelector)
+	if !ok {
+		t.Fatalf("selector type = %T, want CodexQuotaScoreSelector", got)
+	}
+	if codexQuotaScore.ThresholdPercent != 90 {
+		t.Fatalf("ThresholdPercent = %v, want 90", codexQuotaScore.ThresholdPercent)
 	}
 }
 

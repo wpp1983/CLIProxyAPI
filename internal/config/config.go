@@ -239,6 +239,10 @@ type RoutingConfig struct {
 	// a known quota window has reached this used percentage. 0 disables it.
 	FillFirstThresholdPercent float64 `yaml:"fill-first-threshold-percent,omitempty" json:"fill-first-threshold-percent,omitempty"`
 
+	// CodexQuotaScoreThresholdPercent skips a Codex credential in codex-quota-score
+	// mode once a known quota window has reached this used percentage. 0 disables it.
+	CodexQuotaScoreThresholdPercent float64 `yaml:"codex-quota-score-threshold-percent,omitempty" json:"codex-quota-score-threshold-percent,omitempty"`
+
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Session IDs are extracted from multiple sources:
 	// metadata.user_id (Claude Code session format), X-Session-ID, Session_id (Codex),
@@ -727,6 +731,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	cfg.Routing.Strategy = NormalizeRoutingStrategy(cfg.Routing.Strategy)
 	cfg.Routing.FillFirstThresholdPercent = NormalizeRoutingPercent(cfg.Routing.FillFirstThresholdPercent)
+	cfg.Routing.CodexQuotaScoreThresholdPercent = NormalizeRoutingPercent(cfg.Routing.CodexQuotaScoreThresholdPercent)
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()

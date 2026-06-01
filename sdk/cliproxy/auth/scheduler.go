@@ -33,12 +33,13 @@ const (
 
 // authScheduler keeps the incremental provider/model scheduling state used by Manager.
 type authScheduler struct {
-	mu                        sync.Mutex
-	strategy                  schedulerStrategy
-	fillFirstThresholdPercent float64
-	providers                 map[string]*providerScheduler
-	authProviders             map[string]string
-	mixedCursors              map[string]int
+	mu                              sync.Mutex
+	strategy                        schedulerStrategy
+	fillFirstThresholdPercent       float64
+	codexQuotaScoreThresholdPercent float64
+	providers                       map[string]*providerScheduler
+	authProviders                   map[string]string
+	mixedCursors                    map[string]int
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -167,36 +168,41 @@ func normalizeCursor(cursor, size int) int {
 
 // newAuthScheduler constructs an empty scheduler configured for the supplied selector strategy.
 func newAuthScheduler(selector Selector) *authScheduler {
-	strategy, thresholdPercent := selectorSchedulerConfig(selector)
+	strategy, fillFirstThresholdPercent, codexQuotaScoreThresholdPercent := selectorSchedulerConfig(selector)
 	return &authScheduler{
-		strategy:                  strategy,
-		fillFirstThresholdPercent: thresholdPercent,
-		providers:                 make(map[string]*providerScheduler),
-		authProviders:             make(map[string]string),
-		mixedCursors:              make(map[string]int),
+		strategy:                        strategy,
+		fillFirstThresholdPercent:       fillFirstThresholdPercent,
+		codexQuotaScoreThresholdPercent: codexQuotaScoreThresholdPercent,
+		providers:                       make(map[string]*providerScheduler),
+		authProviders:                   make(map[string]string),
+		mixedCursors:                    make(map[string]int),
 	}
 }
 
 // selectorStrategy maps a selector implementation to the scheduler semantics it should emulate.
 func selectorStrategy(selector Selector) schedulerStrategy {
-	strategy, _ := selectorSchedulerConfig(selector)
+	strategy, _, _ := selectorSchedulerConfig(selector)
 	return strategy
 }
 
-func selectorSchedulerConfig(selector Selector) (schedulerStrategy, float64) {
+func selectorSchedulerConfig(selector Selector) (schedulerStrategy, float64, float64) {
 	switch selector.(type) {
 	case *FillFirstSelector:
 		fillFirst := selector.(*FillFirstSelector)
 		if fillFirst == nil {
-			return schedulerStrategyFillFirst, 0
+			return schedulerStrategyFillFirst, 0, 0
 		}
-		return schedulerStrategyFillFirst, fillFirst.ThresholdPercent
+		return schedulerStrategyFillFirst, fillFirst.ThresholdPercent, 0
 	case *CodexQuotaScoreSelector:
-		return schedulerStrategyCodexQuotaScore, 0
+		codexQuotaScore := selector.(*CodexQuotaScoreSelector)
+		if codexQuotaScore == nil {
+			return schedulerStrategyCodexQuotaScore, 0, 0
+		}
+		return schedulerStrategyCodexQuotaScore, 0, codexQuotaScore.ThresholdPercent
 	case nil, *RoundRobinSelector:
-		return schedulerStrategyRoundRobin, 0
+		return schedulerStrategyRoundRobin, 0, 0
 	default:
-		return schedulerStrategyCustom, 0
+		return schedulerStrategyCustom, 0, 0
 	}
 }
 
@@ -207,7 +213,7 @@ func (s *authScheduler) setSelector(selector Selector) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.strategy, s.fillFirstThresholdPercent = selectorSchedulerConfig(selector)
+	s.strategy, s.fillFirstThresholdPercent, s.codexQuotaScoreThresholdPercent = selectorSchedulerConfig(selector)
 	clear(s.mixedCursors)
 }
 
@@ -285,7 +291,7 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
-	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, s.fillFirstThresholdPercent, predicate); picked != nil {
+	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, s.fillFirstThresholdPercent, s.codexQuotaScoreThresholdPercent, predicate); picked != nil {
 		return picked, nil
 	}
 	return nil, shard.unavailableErrorLocked(provider, model, predicate)
@@ -338,7 +344,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			_, ok := tried[pinnedAuthID]
 			return !ok
 		}
-		if picked := shard.pickReadyLocked(false, s.strategy, s.fillFirstThresholdPercent, predicate); picked != nil {
+		if picked := shard.pickReadyLocked(false, s.strategy, s.fillFirstThresholdPercent, s.codexQuotaScoreThresholdPercent, predicate); picked != nil {
 			return picked, providerKey, nil
 		}
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
@@ -396,7 +402,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			}
 		}
 		if allCodex && len(codexCandidates) > 0 {
-			picked := pickBestCodexQuotaScoreScheduledAuth(codexCandidates, now)
+			picked := pickBestCodexQuotaScoreScheduledAuth(codexCandidates, now, s.codexQuotaScoreThresholdPercent)
 			if picked != nil && picked.auth != nil {
 				return picked.auth, strings.ToLower(strings.TrimSpace(picked.auth.Provider)), nil
 			}
@@ -409,7 +415,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 			if shard == nil {
 				continue
 			}
-			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, s.fillFirstThresholdPercent, predicate)
+			picked := shard.pickReadyAtPriorityLocked(false, bestPriority, s.strategy, s.fillFirstThresholdPercent, s.codexQuotaScoreThresholdPercent, predicate)
 			if picked != nil {
 				return picked, providerKey, nil
 			}
@@ -463,7 +469,7 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		if shard == nil {
 			continue
 		}
-		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, 0, predicate)
+		picked := shard.pickReadyAtPriorityLocked(false, bestPriority, schedulerStrategyRoundRobin, 0, 0, predicate)
 		if picked == nil {
 			continue
 		}
@@ -803,7 +809,7 @@ func (m *modelScheduler) promoteExpiredLocked(now time.Time) {
 }
 
 // pickReadyLocked selects the next ready auth from the highest available priority bucket.
-func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, fillFirstThresholdPercent float64, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedulerStrategy, fillFirstThresholdPercent, codexQuotaScoreThresholdPercent float64, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -812,7 +818,7 @@ func (m *modelScheduler) pickReadyLocked(preferWebsocket bool, strategy schedule
 	if !okPriority {
 		return nil
 	}
-	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, fillFirstThresholdPercent, predicate)
+	return m.pickReadyAtPriorityLocked(preferWebsocket, priorityReady, strategy, fillFirstThresholdPercent, codexQuotaScoreThresholdPercent, predicate)
 }
 
 // highestReadyPriorityLocked returns the highest priority bucket that still has a matching ready auth.
@@ -848,7 +854,7 @@ func (m *modelScheduler) highestReadyPriorityLocked(preferWebsocket bool, predic
 
 // pickReadyAtPriorityLocked selects the next ready auth from a specific priority bucket.
 // The caller must ensure expired entries are already promoted when needed.
-func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, fillFirstThresholdPercent float64, predicate func(*scheduledAuth) bool) *Auth {
+func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priority int, strategy schedulerStrategy, fillFirstThresholdPercent, codexQuotaScoreThresholdPercent float64, predicate func(*scheduledAuth) bool) *Auth {
 	if m == nil {
 		return nil
 	}
@@ -869,7 +875,7 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 	} else if strategy == schedulerStrategyCodexQuotaScore {
 		entries := view.readyEntries(predicate)
 		if scheduledEntriesAllCodex(entries) {
-			picked = pickStickyOrBestCodexQuotaScoreScheduledAuth(m.modelKey, entries, time.Now())
+			picked = pickStickyOrBestCodexQuotaScoreScheduledAuth(m.modelKey, entries, time.Now(), codexQuotaScoreThresholdPercent)
 		} else {
 			picked = view.pickRoundRobin(predicate)
 		}
@@ -894,7 +900,7 @@ func fillFirstThresholdPredicate(predicate func(*scheduledAuth) bool, thresholdP
 		if entry == nil || entry.auth == nil {
 			return false
 		}
-		return !shouldSkipForFillFirstQuotaThreshold(entry.auth, thresholdPercent, now)
+		return !shouldSkipForCodexQuotaThreshold(entry.auth, thresholdPercent, now)
 	}
 }
 
@@ -927,7 +933,7 @@ func (m *modelScheduler) readyEntriesAtPriorityLocked(preferWebsocket bool, prio
 	return view.readyEntries(predicate)
 }
 
-func pickBestCodexQuotaScoreScheduledAuth(entries []*scheduledAuth, now time.Time) *scheduledAuth {
+func pickBestCodexQuotaScoreScheduledAuth(entries []*scheduledAuth, now time.Time, thresholdPercent float64) *scheduledAuth {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -940,6 +946,7 @@ func pickBestCodexQuotaScoreScheduledAuth(entries []*scheduledAuth, now time.Tim
 		auths = append(auths, entry.auth)
 		byID[entry.auth.ID] = entry
 	}
+	auths = applyCodexQuotaThreshold(auths, thresholdPercent, now)
 	picked := pickBestCodexQuotaScoreAuth(auths, now)
 	if picked == nil {
 		return nil
@@ -947,7 +954,7 @@ func pickBestCodexQuotaScoreScheduledAuth(entries []*scheduledAuth, now time.Tim
 	return byID[picked.ID]
 }
 
-func pickStickyOrBestCodexQuotaScoreScheduledAuth(model string, entries []*scheduledAuth, now time.Time) *scheduledAuth {
+func pickStickyOrBestCodexQuotaScoreScheduledAuth(model string, entries []*scheduledAuth, now time.Time, thresholdPercent float64) *scheduledAuth {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -960,6 +967,7 @@ func pickStickyOrBestCodexQuotaScoreScheduledAuth(model string, entries []*sched
 		auths = append(auths, entry.auth)
 		byID[entry.auth.ID] = entry
 	}
+	auths = applyCodexQuotaThreshold(auths, thresholdPercent, now)
 	picked := pickStickyOrBestCodexQuotaScoreAuth(globalCodexStickySelection, "codex", model, auths, now)
 	if picked == nil {
 		return nil

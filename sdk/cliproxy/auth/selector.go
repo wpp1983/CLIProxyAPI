@@ -42,8 +42,11 @@ type FillFirstSelector struct {
 // CodexQuotaScoreSelector applies Codex quota-aware ranking when every candidate
 // in the active slice is a Codex auth. Otherwise it falls back to round-robin.
 type CodexQuotaScoreSelector struct {
-	fallback RoundRobinSelector
-	sticky   *codexStickySelectionState
+	// ThresholdPercent skips Codex credentials with known quota windows once
+	// usage reaches this percentage. 0 keeps legacy quota-score behavior.
+	ThresholdPercent float64
+	fallback         RoundRobinSelector
+	sticky           *codexStickySelectionState
 }
 
 type codexStickySelectionState struct {
@@ -386,18 +389,18 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	available = applyFillFirstQuotaThreshold(available, s.ThresholdPercent, now)
+	available = applyCodexQuotaThreshold(available, s.ThresholdPercent, now)
 	return available[0], nil
 }
 
-func applyFillFirstQuotaThreshold(auths []*Auth, thresholdPercent float64, now time.Time) []*Auth {
+func applyCodexQuotaThreshold(auths []*Auth, thresholdPercent float64, now time.Time) []*Auth {
 	if len(auths) <= 1 || thresholdPercent <= 0 {
 		return auths
 	}
 	kept := make([]*Auth, 0, len(auths))
 	skipped := 0
 	for _, auth := range auths {
-		if shouldSkipForFillFirstQuotaThreshold(auth, thresholdPercent, now) {
+		if shouldSkipForCodexQuotaThreshold(auth, thresholdPercent, now) {
 			skipped++
 			continue
 		}
@@ -409,7 +412,7 @@ func applyFillFirstQuotaThreshold(auths []*Auth, thresholdPercent float64, now t
 	return kept
 }
 
-func shouldSkipForFillFirstQuotaThreshold(auth *Auth, thresholdPercent float64, now time.Time) bool {
+func shouldSkipForCodexQuotaThreshold(auth *Auth, thresholdPercent float64, now time.Time) bool {
 	if auth == nil || !IsCodexOAuthLikeAuth(auth) {
 		return false
 	}
@@ -439,6 +442,7 @@ func (s *CodexQuotaScoreSelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
+	available = applyCodexQuotaThreshold(available, s.ThresholdPercent, now)
 	if canUseCodexQuotaScoreSelection(provider, available) {
 		if picked := pickStickyOrBestCodexQuotaScoreAuth(s.stickyState(), provider, model, available, now); picked != nil {
 			return picked, nil

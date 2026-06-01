@@ -165,6 +165,25 @@ func TestSchedulerPick_CodexQuotaScorePrefersBestCodexCandidate(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_CodexQuotaScoreSkipsCodexOverQuotaThreshold(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(10 * time.Hour)
+	overThresholdHighScore := newCodexScoreTestAuth("over-threshold", 5, 100, resetAt, 100)
+	overThresholdHighScore.Provider = "codex"
+	underThresholdLowerScore := newCodexScoreTestAuth("under-threshold", 50, 100, resetAt, 0)
+	underThresholdLowerScore.Provider = "codex"
+
+	scheduler := newSchedulerForTest(&CodexQuotaScoreSelector{ThresholdPercent: 90}, overThresholdHighScore, underThresholdLowerScore)
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "under-threshold" {
+		t.Fatalf("pickSingle() auth = %#v, want under-threshold", got)
+	}
+}
+
 func TestSchedulerPick_CodexQuotaScoreFreshKnownOutranksStaleOrFailedRefresh(t *testing.T) {
 	t.Parallel()
 
@@ -543,6 +562,14 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	manager.SetSelector(&FillFirstSelector{ThresholdPercent: 90})
 	if manager.scheduler.fillFirstThresholdPercent != 90 {
 		t.Fatalf("manager.scheduler.fillFirstThresholdPercent = %v, want 90", manager.scheduler.fillFirstThresholdPercent)
+	}
+
+	manager.SetSelector(&CodexQuotaScoreSelector{ThresholdPercent: 80})
+	if manager.scheduler.strategy != schedulerStrategyCodexQuotaScore {
+		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyCodexQuotaScore)
+	}
+	if manager.scheduler.codexQuotaScoreThresholdPercent != 80 {
+		t.Fatalf("manager.scheduler.codexQuotaScoreThresholdPercent = %v, want 80", manager.scheduler.codexQuotaScoreThresholdPercent)
 	}
 }
 

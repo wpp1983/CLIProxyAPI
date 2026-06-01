@@ -75,6 +75,7 @@ func ParseConfigBytes(data []byte) (*Config, error) {
 
 	cfg.Routing.Strategy = NormalizeRoutingStrategy(cfg.Routing.Strategy)
 	cfg.Routing.FillFirstThresholdPercent = NormalizeRoutingPercent(cfg.Routing.FillFirstThresholdPercent)
+	cfg.Routing.CodexQuotaScoreThresholdPercent = NormalizeRoutingPercent(cfg.Routing.CodexQuotaScoreThresholdPercent)
 
 	// Apply the same sanitization pipeline.
 	cfg.SanitizeGeminiKeys()
