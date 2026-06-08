@@ -232,8 +232,16 @@ type QuotaExceeded struct {
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
 	// Strategy selects the credential selection strategy.
-	// Supported values: "round-robin" (default), "fill-first".
+	// Supported values: "round-robin" (default), "fill-first", "codex-quota-score".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+
+	// FillFirstThresholdPercent skips a Codex credential in fill-first mode once
+	// a known quota window has reached this used percentage. 0 disables it.
+	FillFirstThresholdPercent float64 `yaml:"fill-first-threshold-percent,omitempty" json:"fill-first-threshold-percent,omitempty"`
+
+	// CodexQuotaScoreThresholdPercent skips a Codex credential in codex-quota-score
+	// mode once a known quota window has reached this used percentage. 0 disables it.
+	CodexQuotaScoreThresholdPercent float64 `yaml:"codex-quota-score-threshold-percent,omitempty" json:"codex-quota-score-threshold-percent,omitempty"`
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Session IDs are extracted from multiple sources:
@@ -720,6 +728,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.MaxRetryCredentials < 0 {
 		cfg.MaxRetryCredentials = 0
 	}
+
+	cfg.Routing.Strategy = NormalizeRoutingStrategy(cfg.Routing.Strategy)
+	cfg.Routing.FillFirstThresholdPercent = NormalizeRoutingPercent(cfg.Routing.FillFirstThresholdPercent)
+	cfg.Routing.CodexQuotaScoreThresholdPercent = NormalizeRoutingPercent(cfg.Routing.CodexQuotaScoreThresholdPercent)
 
 	// Sanitize Gemini API key configuration and migrate legacy entries.
 	cfg.SanitizeGeminiKeys()

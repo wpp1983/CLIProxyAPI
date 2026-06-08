@@ -116,7 +116,10 @@ quota-exceeded:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), fill-first
+  strategy: "round-robin" # round-robin (default), fill-first, codex-quota-score
+  # In fill-first mode, skip a Codex auth once a known quota window reaches this used percentage.
+  # Example: 90 switches to the next auth at 90% used instead of waiting for 100%. 0 disables it.
+  fill-first-threshold-percent: 0
   # Enable universal session-sticky routing for all clients.
   # Session IDs are extracted from: metadata.user_id (Claude Code session format),
   # X-Session-ID, Session_id (Codex), X-Amp-Thread-Id (Amp CLI),

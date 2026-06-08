@@ -119,6 +119,109 @@ func TestSchedulerPick_FillFirstSticksToFirstReady(t *testing.T) {
 	}
 }
 
+func TestSchedulerPick_FillFirstSkipsCodexOverQuotaThreshold(t *testing.T) {
+	t.Parallel()
+
+	refreshAt := time.Now().Add(-1 * time.Minute).UTC()
+	first := &Auth{ID: "a-first", Provider: "codex"}
+	first.SetCodexQuotaState(CodexQuotaState{
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(9), Limit: float64Ptr(100)},
+		LastRefreshAt: &refreshAt,
+		RefreshStatus: "ok",
+	})
+	second := &Auth{ID: "b-second", Provider: "codex"}
+	second.SetCodexQuotaState(CodexQuotaState{
+		FiveHour:      CodexQuotaBucket{Remaining: float64Ptr(40), Limit: float64Ptr(100)},
+		LastRefreshAt: &refreshAt,
+		RefreshStatus: "ok",
+	})
+	scheduler := newSchedulerForTest(&FillFirstSelector{ThresholdPercent: 90}, second, first)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "b-second" {
+		t.Fatalf("pickSingle() auth = %#v, want b-second", got)
+	}
+}
+
+func TestSchedulerPick_CodexQuotaScorePrefersBestCodexCandidate(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(10 * time.Hour)
+	strong := newCodexScoreTestAuth("strong", 30, 100, resetAt, 0)
+	strong.Provider = "codex"
+	weak := newCodexScoreTestAuth("weak", 10, 100, resetAt, 0)
+	weak.Provider = "codex"
+
+	scheduler := newSchedulerForTest(&CodexQuotaScoreSelector{}, weak, strong)
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "strong" {
+		t.Fatalf("pickSingle() auth = %#v, want strong", got)
+	}
+}
+
+func TestSchedulerPick_CodexQuotaScoreSkipsCodexOverQuotaThreshold(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(10 * time.Hour)
+	overThresholdHighScore := newCodexScoreTestAuth("over-threshold", 5, 100, resetAt, 100)
+	overThresholdHighScore.Provider = "codex"
+	underThresholdLowerScore := newCodexScoreTestAuth("under-threshold", 50, 100, resetAt, 0)
+	underThresholdLowerScore.Provider = "codex"
+
+	scheduler := newSchedulerForTest(&CodexQuotaScoreSelector{ThresholdPercent: 90}, overThresholdHighScore, underThresholdLowerScore)
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "under-threshold" {
+		t.Fatalf("pickSingle() auth = %#v, want under-threshold", got)
+	}
+}
+
+func TestSchedulerPick_CodexQuotaScoreFreshKnownOutranksStaleOrFailedRefresh(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(10 * time.Hour)
+	fresh := newCodexScoreTestAuth("fresh", 20, 100, resetAt, 0)
+	staleRefreshAt := time.Now().Add(-20 * time.Minute).UTC()
+	stale := &Auth{ID: "stale", Provider: "codex"}
+	stale.SetCodexQuotaState(CodexQuotaState{
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(90),
+			Limit:     float64Ptr(100),
+			ResetAt:   &resetAt,
+		},
+		LastRefreshAt: &staleRefreshAt,
+		RefreshStatus: "ok",
+	})
+	failedRefreshAt := time.Now().Add(-1 * time.Minute).UTC()
+	failed := &Auth{ID: "failed", Provider: "codex"}
+	failed.SetCodexQuotaState(CodexQuotaState{
+		Weekly: CodexQuotaBucket{
+			Remaining: float64Ptr(95),
+			Limit:     float64Ptr(100),
+			ResetAt:   &resetAt,
+		},
+		LastRefreshAt: &failedRefreshAt,
+		RefreshStatus: "error",
+	})
+
+	scheduler := newSchedulerForTest(&CodexQuotaScoreSelector{}, stale, failed, fresh)
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil || got.ID != "fresh" {
+		t.Fatalf("pickSingle() auth = %#v, want fresh", got)
+	}
+}
+
 func TestSchedulerPick_PromotesExpiredCooldownBeforePick(t *testing.T) {
 	t.Parallel()
 
@@ -260,6 +363,53 @@ func TestSchedulerPick_MixedProvidersUsesWeightedProviderRotationOverReadyCandid
 		if got.ID != wantIDs[index] {
 			t.Fatalf("pickMixed() #%d auth.ID = %q, want %q", index, got.ID, wantIDs[index])
 		}
+	}
+}
+
+func TestSchedulerPick_MixedProvidersCodexQuotaScoreFallsBackToRoundRobinWhenSliceIsNotAllCodex(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(10 * time.Hour)
+	scheduler := newSchedulerForTest(
+		&CodexQuotaScoreSelector{},
+		newCodexScoreTestAuth("codex-a", 50, 100, resetAt, 0),
+		&Auth{ID: "gemini-a", Provider: "gemini"},
+	)
+
+	first, provider, errPick := scheduler.pickMixed(context.Background(), []string{"codex", "gemini"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() error = %v", errPick)
+	}
+	if first == nil {
+		t.Fatal("pickMixed() auth = nil")
+	}
+	if provider != "codex" || first.ID != "codex-a" {
+		t.Fatalf("pickMixed() = provider %q auth %q, want codex/codex-a from round-robin weighted fallback", provider, first.ID)
+	}
+
+	second, provider, errPick := scheduler.pickMixed(context.Background(), []string{"codex", "gemini"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() second error = %v", errPick)
+	}
+	if second == nil || provider != "gemini" || second.ID != "gemini-a" {
+		t.Fatalf("pickMixed() second = provider %q auth %#v, want gemini/gemini-a", provider, second)
+	}
+}
+
+func TestSchedulerPick_MixedProvidersCodexQuotaScoreUsesScoringWhenAllCandidatesCodex(t *testing.T) {
+	t.Parallel()
+
+	resetAt := time.Now().Add(10 * time.Hour)
+	strong := newCodexScoreTestAuth("codex-strong", 50, 100, resetAt, 0)
+	weak := newCodexScoreTestAuth("codex-weak", 10, 100, resetAt, 0)
+	scheduler := newSchedulerForTest(&CodexQuotaScoreSelector{}, strong, weak)
+
+	got, provider, errPick := scheduler.pickMixed(context.Background(), []string{"codex", "gemini"}, "", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickMixed() error = %v", errPick)
+	}
+	if got == nil || provider != "codex" || got.ID != "codex-strong" {
+		t.Fatalf("pickMixed() = provider %q auth %#v, want codex/codex-strong", provider, got)
 	}
 }
 
@@ -407,6 +557,19 @@ func TestManager_InitializesSchedulerForBuiltInSelector(t *testing.T) {
 	manager.SetSelector(&FillFirstSelector{})
 	if manager.scheduler.strategy != schedulerStrategyFillFirst {
 		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyFillFirst)
+	}
+
+	manager.SetSelector(&FillFirstSelector{ThresholdPercent: 90})
+	if manager.scheduler.fillFirstThresholdPercent != 90 {
+		t.Fatalf("manager.scheduler.fillFirstThresholdPercent = %v, want 90", manager.scheduler.fillFirstThresholdPercent)
+	}
+
+	manager.SetSelector(&CodexQuotaScoreSelector{ThresholdPercent: 80})
+	if manager.scheduler.strategy != schedulerStrategyCodexQuotaScore {
+		t.Fatalf("manager.scheduler.strategy = %v, want %v", manager.scheduler.strategy, schedulerStrategyCodexQuotaScore)
+	}
+	if manager.scheduler.codexQuotaScoreThresholdPercent != 80 {
+		t.Fatalf("manager.scheduler.codexQuotaScoreThresholdPercent = %v, want 80", manager.scheduler.codexQuotaScoreThresholdPercent)
 	}
 }
 

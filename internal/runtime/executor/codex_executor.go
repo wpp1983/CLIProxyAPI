@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -36,6 +37,7 @@ import (
 
 const (
 	codexUserAgent             = "codex-tui/0.135.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.135.0)"
+	codexQuotaRefreshUserAgent = "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal"
 	codexOriginator            = "codex-tui"
 	codexDefaultImageToolModel = "gpt-image-2"
 )
@@ -1382,32 +1384,614 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 			refreshToken = v
 		}
 	}
-	if refreshToken == "" {
-		return auth, nil
-	}
-	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
-	if err != nil {
-		return nil, err
-	}
 	if auth.Metadata == nil {
 		auth.Metadata = make(map[string]any)
 	}
-	auth.Metadata["id_token"] = td.IDToken
-	auth.Metadata["access_token"] = td.AccessToken
-	if td.RefreshToken != "" {
-		auth.Metadata["refresh_token"] = td.RefreshToken
+	if refreshToken != "" {
+		svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
+		td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+		if err != nil {
+			return nil, err
+		}
+		auth.Metadata["id_token"] = td.IDToken
+		auth.Metadata["access_token"] = td.AccessToken
+		if td.RefreshToken != "" {
+			auth.Metadata["refresh_token"] = td.RefreshToken
+		}
+		if td.AccountID != "" {
+			auth.Metadata["account_id"] = td.AccountID
+		}
+		auth.Metadata["email"] = td.Email
+		// Use unified key in files
+		auth.Metadata["expired"] = td.Expire
+		auth.Metadata["type"] = "codex"
 	}
-	if td.AccountID != "" {
-		auth.Metadata["account_id"] = td.AccountID
+	now := time.Now().UTC()
+	if cliproxyauth.IsCodexOAuthLikeAuth(auth) {
+		cliproxyauth.EnsureCodexQuotaRefreshMetadata(auth)
+		if quotaState, blockedUntil, err := e.refreshCodexQuotaState(ctx, auth, now); err != nil {
+			previous, _ := auth.GetCodexQuotaState()
+			previous.RefreshStatus = "error"
+			previous.RefreshError = strings.TrimSpace(err.Error())
+			auth.SetCodexQuotaState(previous)
+		} else {
+			verifiedRecovery := false
+			if blockedUntil == nil {
+				if probeResetAt, ok := quotaState.CodexProbeEligibleResetAt(now); ok {
+					quotaState, verifiedRecovery = e.verifyCodexQuotaRecovery(ctx, auth, quotaState, now, *probeResetAt)
+				} else if windowResetAt, ok := quotaState.CodexProbeWindowResetAt(now); ok {
+					verifiedRecovery = quotaState.CodexProbeVerifiedForReset(*windowResetAt)
+				}
+			}
+			auth.SetCodexQuotaState(quotaState)
+			switch {
+			case blockedUntil != nil:
+				cliproxyauth.ApplyCodexQuotaBlockedUntil(auth, blockedUntil)
+			case verifiedRecovery:
+				cliproxyauth.ApplyCodexQuotaBlockedUntil(auth, nil)
+			}
+		}
 	}
-	auth.Metadata["email"] = td.Email
-	// Use unified key in files
-	auth.Metadata["expired"] = td.Expire
-	auth.Metadata["type"] = "codex"
-	now := time.Now().Format(time.RFC3339)
-	auth.Metadata["last_refresh"] = now
+	auth.Metadata["last_refresh"] = now.Format(time.RFC3339)
 	return auth, nil
+}
+
+func (e *CodexExecutor) verifyCodexQuotaRecovery(ctx context.Context, auth *cliproxyauth.Auth, state cliproxyauth.CodexQuotaState, now, resetAt time.Time) (cliproxyauth.CodexQuotaState, bool) {
+	resetAt = resetAt.UTC()
+	probeAt := now.UTC()
+	state.ProbeResetAt = &resetAt
+	state.ProbeAt = &probeAt
+	state.ProbeVerifiedAt = nil
+	state.ProbeStatus = "failed"
+	state.ProbeError = ""
+	if auth != nil {
+		cliproxyauth.ReleaseCodexStickyAuth(auth.ID)
+	}
+
+	if err := e.runCodexQuotaRecoveryProbe(ctx, auth); err != nil {
+		state.ProbeStatus = "failed"
+		state.ProbeError = strings.TrimSpace(err.Error())
+		return state, false
+	}
+
+	state.ProbeVerifiedAt = &probeAt
+	state.ProbeStatus = "verified"
+	state.ProbeError = ""
+	return state, state.CodexProbeVerifiedForReset(resetAt)
+}
+
+func (e *CodexExecutor) runCodexQuotaRecoveryProbe(ctx context.Context, auth *cliproxyauth.Auth) error {
+	token, baseURL := codexCreds(auth)
+	if strings.TrimSpace(token) == "" {
+		return fmt.Errorf("codex recovery probe: access token missing")
+	}
+	if strings.TrimSpace(baseURL) == "" {
+		baseURL = "https://chatgpt.com/backend-api/codex"
+	}
+	probeURL := strings.TrimSuffix(baseURL, "/") + "/responses/compact"
+	body := []byte(`{"model":"gpt-5.4-mini","instructions":"","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}]}`)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, probeURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("codex recovery probe: build request failed: %w", err)
+	}
+	applyCodexHeaders(httpReq, auth, token, false, e.cfg)
+	httpReq.Header.Set("Accept", "application/json")
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpResp, err := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("codex recovery probe: request failed: %w", err)
+	}
+	defer closeHTTPResponseBody(httpResp, "codex recovery probe: close response body error")
+	responseBody, err := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	if err != nil {
+		return fmt.Errorf("codex recovery probe: read response failed: %w", err)
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return fmt.Errorf("codex recovery probe: %s returned %d: %s", probeURL, httpResp.StatusCode, strings.TrimSpace(string(responseBody)))
+	}
+	if !codexProbeUsageEvidence(responseBody) {
+		return fmt.Errorf("codex recovery probe: no usage evidence in successful response")
+	}
+	return nil
+}
+
+func codexProbeUsageEvidence(body []byte) bool {
+	paths := []string{
+		"usage.total_tokens",
+		"usage.prompt_tokens",
+		"usage.input_tokens",
+		"usage.completion_tokens",
+		"usage.output_tokens",
+		"response.usage.total_tokens",
+		"response.usage.prompt_tokens",
+		"response.usage.input_tokens",
+		"response.usage.completion_tokens",
+		"response.usage.output_tokens",
+	}
+	for _, path := range paths {
+		if gjson.GetBytes(body, path).Int() > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+type codexQuotaRefreshPayload struct {
+	state        cliproxyauth.CodexQuotaState
+	blockedUntil *time.Time
+}
+
+func (e *CodexExecutor) refreshCodexQuotaState(ctx context.Context, auth *cliproxyauth.Auth, now time.Time) (cliproxyauth.CodexQuotaState, *time.Time, error) {
+	token, baseURL := codexCreds(auth)
+	if strings.TrimSpace(token) == "" {
+		return cliproxyauth.CodexQuotaState{}, nil, fmt.Errorf("codex quota refresh: access token missing")
+	}
+	urls := codexQuotaRefreshURLs(baseURL)
+	previous, _ := auth.GetCodexQuotaState()
+	merged := cloneCodexQuotaState(previous)
+	var blockedUntil *time.Time
+	var errs []string
+	hadData := false
+	for _, endpoint := range urls {
+		body, err := e.fetchCodexQuotaRefreshDocument(ctx, auth, token, endpoint)
+		if err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		payload, ok := parseCodexQuotaRefreshPayload(body)
+		if !ok {
+			errs = append(errs, fmt.Sprintf("codex quota refresh: no quota data at %s", endpoint))
+			continue
+		}
+		hadData = true
+		if codexQuotaBucketHasData(payload.state.FiveHour) {
+			merged.FiveHour = payload.state.FiveHour
+		}
+		if codexQuotaBucketHasData(payload.state.Weekly) {
+			merged.Weekly = payload.state.Weekly
+		}
+		if payload.blockedUntil != nil && !payload.blockedUntil.IsZero() {
+			until := payload.blockedUntil.UTC()
+			blockedUntil = &until
+		}
+	}
+	if !hadData {
+		if len(errs) == 0 {
+			return cliproxyauth.CodexQuotaState{}, nil, fmt.Errorf("codex quota refresh: no usable quota response")
+		}
+		return cliproxyauth.CodexQuotaState{}, nil, fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	merged.LastRefreshAt = &now
+	merged.RefreshStatus = "ok"
+	merged.RefreshError = ""
+	return merged, blockedUntil, nil
+}
+
+func (e *CodexExecutor) fetchCodexQuotaRefreshDocument(ctx context.Context, auth *cliproxyauth.Auth, token, rawURL string) ([]byte, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("codex quota refresh: build request %s: %w", rawURL, err)
+	}
+	applyCodexQuotaRefreshHeaders(httpReq, auth, token)
+	httpReq.Header.Set("Accept", "application/json")
+	httpResp, err := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0).Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("codex quota refresh: request %s failed: %w", rawURL, err)
+	}
+	defer closeHTTPResponseBody(httpResp, "codex quota refresh: close response body error")
+	body, err := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("codex quota refresh: read %s failed: %w", rawURL, err)
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		return nil, fmt.Errorf("codex quota refresh: %s returned %d: %s", rawURL, httpResp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return body, nil
+}
+
+func applyCodexQuotaRefreshHeaders(r *http.Request, auth *cliproxyauth.Auth, token string) {
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "application/json")
+	r.Header.Set("User-Agent", codexQuotaRefreshUserAgent)
+	if auth != nil && auth.Metadata != nil {
+		if accountID, ok := auth.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
+			r.Header.Set("Chatgpt-Account-Id", accountID)
+		}
+	}
+	var attrs map[string]string
+	if auth != nil {
+		attrs = auth.Attributes
+	}
+	util.ApplyCustomHeadersFromAttrs(r, attrs)
+}
+
+func codexQuotaRefreshURLs(baseURL string) []string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if trimmed == "" {
+		trimmed = "https://chatgpt.com/backend-api/codex"
+	}
+	candidates := []string{codexQuotaUsageURLFromBase(trimmed)}
+	seen := make(map[string]struct{}, len(candidates))
+	out := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, err := url.Parse(candidate); err != nil {
+			continue
+		}
+		if _, ok := seen[candidate]; ok {
+			continue
+		}
+		seen[candidate] = struct{}{}
+		out = append(out, candidate)
+	}
+	return out
+}
+
+func codexQuotaUsageURLFromBase(baseURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if trimmed == "" {
+		return "https://chatgpt.com/backend-api/wham/usage"
+	}
+	if base, ok := trimSuffixFold(trimmed, "/codex/usage"); ok {
+		return base + "/wham/usage"
+	}
+	if base, ok := trimSuffixFold(trimmed, "/usage"); ok {
+		if _, ok := trimSuffixFold(base, "/wham"); ok {
+			return trimmed
+		}
+	}
+	if base, ok := trimSuffixFold(trimmed, "/codex"); ok {
+		return base + "/wham/usage"
+	}
+	if _, ok := trimSuffixFold(trimmed, "/wham"); ok {
+		return trimmed + "/usage"
+	}
+	if _, ok := trimSuffixFold(trimmed, "/backend-api"); ok {
+		return trimmed + "/wham/usage"
+	}
+	return trimmed + "/usage"
+}
+
+func trimSuffixFold(value, suffix string) (string, bool) {
+	if !strings.HasSuffix(strings.ToLower(value), strings.ToLower(suffix)) {
+		return value, false
+	}
+	return value[:len(value)-len(suffix)], true
+}
+
+func parseCodexQuotaRefreshPayload(body []byte) (codexQuotaRefreshPayload, bool) {
+	payload := codexQuotaRefreshPayload{}
+	now := time.Now().UTC()
+	payload.state.FiveHour = parseCodexQuotaBucket(body,
+		"quota.five_hour", "quota.fiveHour", "five_hour", "fiveHour",
+		"usage.five_hour", "usage.fiveHour", "ratelimits.five_hour", "ratelimits.fiveHour",
+	)
+	payload.state.Weekly = parseCodexQuotaBucket(body,
+		"quota.weekly", "quota.weekly_window", "weekly", "weekly_window",
+		"usage.weekly", "usage.weekly_window", "ratelimits.weekly", "ratelimits.weekly_window",
+	)
+	if !codexQuotaBucketHasData(payload.state.Weekly) {
+		payload.state.Weekly = parseCodexQuotaWindowByDuration(body, now, "rate_limit", 7*24*time.Hour)
+		if !codexQuotaBucketHasData(payload.state.Weekly) {
+			payload.state.Weekly = parseCodexQuotaBucketAt(body, now, "rate_limit.secondary_window")
+		}
+	}
+	if !codexQuotaBucketHasData(payload.state.FiveHour) {
+		payload.state.FiveHour = parseCodexQuotaWindowByDuration(body, now, "rate_limit", 5*time.Hour)
+		if !codexQuotaBucketHasData(payload.state.FiveHour) {
+			payload.state.FiveHour = parseCodexQuotaBucketAt(body, now, "rate_limit.primary_window")
+		}
+	}
+	mergeCodexAdditionalRateLimitBuckets(body, &payload.state)
+	if blockedUntil, ok := firstTimePath(body,
+		"quota_blocked_until", "quota.blocked_until", "quota.blockedUntil",
+		"blocked_until", "blockedUntil", "ratelimits.blocked_until", "ratelimits.blockedUntil",
+		"error.resets_at", "rate_limit.blocked_until", "rate_limit.blockedUntil",
+		"rate_limit.primary_window.blocked_until", "rate_limit.primary_window.blockedUntil",
+		"rate_limit.secondary_window.blocked_until", "rate_limit.secondary_window.blockedUntil",
+	); ok {
+		payload.blockedUntil = &blockedUntil
+	}
+	return payload, codexQuotaBucketHasData(payload.state.FiveHour) || codexQuotaBucketHasData(payload.state.Weekly) || payload.blockedUntil != nil
+}
+
+func parseCodexQuotaBucket(body []byte, prefixes ...string) cliproxyauth.CodexQuotaBucket {
+	return parseCodexQuotaBucketAt(body, time.Now().UTC(), prefixes...)
+}
+
+func parseCodexQuotaBucketAt(body []byte, now time.Time, prefixes ...string) cliproxyauth.CodexQuotaBucket {
+	for _, prefix := range prefixes {
+		bucket := cliproxyauth.CodexQuotaBucket{}
+		if remaining, ok := firstFloatPath(body,
+			codexQuotaFieldPath(prefix, "remaining"),
+			codexQuotaFieldPath(prefix, "remaining_quota"),
+			codexQuotaFieldPath(prefix, "available"),
+			codexQuotaFieldPath(prefix, "left"),
+		); ok {
+			bucket.Remaining = &remaining
+		}
+		if limit, ok := firstFloatPath(body,
+			codexQuotaFieldPath(prefix, "limit"),
+			codexQuotaFieldPath(prefix, "quota"),
+			codexQuotaFieldPath(prefix, "total"),
+			codexQuotaFieldPath(prefix, "max"),
+		); ok {
+			bucket.Limit = &limit
+		}
+		if resetAt, ok := firstQuotaResetPath(body, now,
+			codexQuotaFieldPath(prefix, "reset_at"),
+			codexQuotaFieldPath(prefix, "resetAt"),
+			codexQuotaFieldPath(prefix, "resets_at"),
+			codexQuotaFieldPath(prefix, "resetsAt"),
+			codexQuotaFieldPath(prefix, "next_reset_at"),
+			codexQuotaFieldPath(prefix, "reset_after_seconds"),
+			codexQuotaFieldPath(prefix, "resetAfterSeconds"),
+			codexQuotaFieldPath(prefix, "resets_after_seconds"),
+			codexQuotaFieldPath(prefix, "resetsAfterSeconds"),
+		); ok {
+			bucket.ResetAt = &resetAt
+		}
+		if bucket.Remaining == nil {
+			if usedPercent, ok := firstFloatPath(body,
+				codexQuotaFieldPath(prefix, "used_percent"),
+				codexQuotaFieldPath(prefix, "usedPercent"),
+			); ok {
+				limit := 100.0
+				remaining := limit - usedPercent
+				if remaining < 0 {
+					remaining = 0
+				}
+				if bucket.Limit == nil {
+					bucket.Limit = &limit
+				}
+				bucket.Remaining = &remaining
+			}
+		}
+		if codexQuotaBucketHasData(bucket) {
+			return bucket
+		}
+	}
+	return cliproxyauth.CodexQuotaBucket{}
+}
+
+func parseCodexQuotaWindowByDuration(body []byte, now time.Time, prefix string, target time.Duration) cliproxyauth.CodexQuotaBucket {
+	for _, windowName := range []string{"primary_window", "primaryWindow", "secondary_window", "secondaryWindow"} {
+		path := codexQuotaFieldPath(prefix, windowName)
+		result := gjson.GetBytes(body, path)
+		if !result.Exists() {
+			continue
+		}
+		seconds, ok := firstFloatPath([]byte(result.Raw), "limit_window_seconds", "limitWindowSeconds")
+		if !ok || time.Duration(seconds*float64(time.Second)) != target {
+			continue
+		}
+		bucket := parseCodexQuotaBucketAt([]byte(result.Raw), now, "")
+		if codexQuotaBucketHasData(bucket) {
+			return bucket
+		}
+	}
+	return cliproxyauth.CodexQuotaBucket{}
+}
+
+func codexQuotaFieldPath(prefix, field string) string {
+	prefix = strings.TrimSpace(prefix)
+	field = strings.TrimSpace(field)
+	if prefix == "" {
+		return field
+	}
+	if field == "" {
+		return prefix
+	}
+	return prefix + "." + field
+}
+
+func mergeCodexAdditionalRateLimitBuckets(body []byte, state *cliproxyauth.CodexQuotaState) {
+	if state == nil {
+		return
+	}
+	for _, path := range []string{"rate_limit.additional_rate_limits", "additional_rate_limits"} {
+		result := gjson.GetBytes(body, path)
+		if !result.Exists() {
+			continue
+		}
+		for _, item := range result.Array() {
+			bucket := parseCodexQuotaBucketAt([]byte(item.Raw), time.Now().UTC(), "")
+			if !codexQuotaBucketHasData(bucket) {
+				continue
+			}
+			switch codexQuotaBucketWindowKind([]byte(item.Raw)) {
+			case "weekly":
+				if !codexQuotaBucketHasData(state.Weekly) {
+					state.Weekly = bucket
+				}
+			case "five_hour":
+				if !codexQuotaBucketHasData(state.FiveHour) {
+					state.FiveHour = bucket
+				}
+			}
+		}
+	}
+}
+
+func codexQuotaBucketWindowKind(body []byte) string {
+	label, _ := firstStringPath(body,
+		"name", "key", "id", "window", "window_name", "windowName", "label", "slug",
+	)
+	label = strings.ToLower(strings.TrimSpace(label))
+	if strings.Contains(label, "week") {
+		return "weekly"
+	}
+	if (strings.Contains(label, "five") || strings.Contains(label, "5")) && strings.Contains(label, "hour") {
+		return "five_hour"
+	}
+	if strings.Contains(label, "secondary") {
+		return "weekly"
+	}
+	if strings.Contains(label, "primary") {
+		return "five_hour"
+	}
+	if seconds, ok := firstFloatPath(body,
+		"window_seconds", "duration_seconds", "interval_seconds", "reset_interval_seconds", "limit_window_seconds", "limitWindowSeconds",
+	); ok {
+		switch {
+		case seconds >= 6*24*60*60:
+			return "weekly"
+		case seconds >= 4*60*60 && seconds <= 6*60*60:
+			return "five_hour"
+		}
+	}
+	return ""
+}
+
+func codexQuotaBucketHasData(bucket cliproxyauth.CodexQuotaBucket) bool {
+	return bucket.Remaining != nil || bucket.Limit != nil || bucket.ResetAt != nil
+}
+
+func cloneCodexQuotaState(state cliproxyauth.CodexQuotaState) cliproxyauth.CodexQuotaState {
+	cloned := cliproxyauth.CodexQuotaState{
+		RefreshStatus: state.RefreshStatus,
+		RefreshError:  state.RefreshError,
+		ProbeStatus:   state.ProbeStatus,
+		ProbeError:    state.ProbeError,
+	}
+	if state.FiveHour.Remaining != nil {
+		value := *state.FiveHour.Remaining
+		cloned.FiveHour.Remaining = &value
+	}
+	if state.FiveHour.Limit != nil {
+		value := *state.FiveHour.Limit
+		cloned.FiveHour.Limit = &value
+	}
+	if state.FiveHour.ResetAt != nil {
+		value := state.FiveHour.ResetAt.UTC()
+		cloned.FiveHour.ResetAt = &value
+	}
+	if state.Weekly.Remaining != nil {
+		value := *state.Weekly.Remaining
+		cloned.Weekly.Remaining = &value
+	}
+	if state.Weekly.Limit != nil {
+		value := *state.Weekly.Limit
+		cloned.Weekly.Limit = &value
+	}
+	if state.Weekly.ResetAt != nil {
+		value := state.Weekly.ResetAt.UTC()
+		cloned.Weekly.ResetAt = &value
+	}
+	if state.LastRefreshAt != nil {
+		value := state.LastRefreshAt.UTC()
+		cloned.LastRefreshAt = &value
+	}
+	if state.ProbeResetAt != nil {
+		value := state.ProbeResetAt.UTC()
+		cloned.ProbeResetAt = &value
+	}
+	if state.ProbeAt != nil {
+		value := state.ProbeAt.UTC()
+		cloned.ProbeAt = &value
+	}
+	if state.ProbeVerifiedAt != nil {
+		value := state.ProbeVerifiedAt.UTC()
+		cloned.ProbeVerifiedAt = &value
+	}
+	return cloned
+}
+
+func firstFloatPath(body []byte, paths ...string) (float64, bool) {
+	for _, path := range paths {
+		result := gjson.GetBytes(body, path)
+		if !result.Exists() {
+			continue
+		}
+		switch result.Type {
+		case gjson.Number:
+			return result.Float(), true
+		case gjson.String:
+			if value, ok := cliproxyauthFloatString(result.String()); ok {
+				return value, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func firstTimePath(body []byte, paths ...string) (time.Time, bool) {
+	for _, path := range paths {
+		result := gjson.GetBytes(body, path)
+		if !result.Exists() {
+			continue
+		}
+		switch result.Type {
+		case gjson.Number:
+			unix := result.Int()
+			if unix > 0 {
+				return time.Unix(unix, 0).UTC(), true
+			}
+		case gjson.String:
+			if parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(result.String())); err == nil {
+				return parsed.UTC(), true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
+func firstQuotaResetPath(body []byte, now time.Time, paths ...string) (time.Time, bool) {
+	absolutePaths := make([]string, 0, len(paths))
+	for _, path := range paths {
+		trimmed := strings.TrimSpace(path)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasSuffix(lower, "seconds") {
+			result := gjson.GetBytes(body, trimmed)
+			if !result.Exists() {
+				continue
+			}
+			seconds := 0.0
+			switch result.Type {
+			case gjson.Number:
+				seconds = result.Float()
+			case gjson.String:
+				if value, ok := cliproxyauthFloatString(result.String()); ok {
+					seconds = value
+				}
+			}
+			if seconds > 0 {
+				return now.Add(time.Duration(seconds * float64(time.Second))).UTC(), true
+			}
+			continue
+		}
+		absolutePaths = append(absolutePaths, trimmed)
+	}
+	return firstTimePath(body, absolutePaths...)
+}
+
+func firstStringPath(body []byte, paths ...string) (string, bool) {
+	for _, path := range paths {
+		result := gjson.GetBytes(body, path)
+		if !result.Exists() || result.Type != gjson.String {
+			continue
+		}
+		value := strings.TrimSpace(result.String())
+		if value != "" {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func cliproxyauthFloatString(raw string) (float64, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return 0, false
+	}
+	result := gjson.Parse(trimmed)
+	if result.Type != gjson.Number {
+		return 0, false
+	}
+	return result.Float(), true
 }
 
 type codexIdentityConfuseState struct {
